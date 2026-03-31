@@ -52,6 +52,32 @@ class TestOrderConstruction:
         assert order.expiration == 0
 
 
+class TestOrderValidation:
+    def test_price_zero_rejected(self):
+        with pytest.raises(ValueError, match="price"):
+            Order(token_id="1", side=Side.BUY, price=0.0, size=1.0)
+
+    def test_price_one_rejected(self):
+        with pytest.raises(ValueError, match="price"):
+            Order(token_id="1", side=Side.BUY, price=1.0, size=1.0)
+
+    def test_negative_price_rejected(self):
+        with pytest.raises(ValueError, match="price"):
+            Order(token_id="1", side=Side.BUY, price=-0.5, size=1.0)
+
+    def test_negative_size_rejected(self):
+        with pytest.raises(ValueError, match="size"):
+            Order(token_id="1", side=Side.BUY, price=0.5, size=-1.0)
+
+    def test_zero_size_rejected(self):
+        with pytest.raises(ValueError, match="size"):
+            Order(token_id="1", side=Side.BUY, price=0.5, size=0.0)
+
+    def test_valid_order_accepted(self):
+        order = Order(token_id="1", side=Side.BUY, price=0.5, size=1.0)
+        assert order.price == 0.5
+
+
 class TestPriceToAmounts:
     def test_buy_amounts(self):
         maker, taker = _price_to_amounts(0.50, 10.0, Side.BUY)

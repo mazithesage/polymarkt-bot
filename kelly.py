@@ -71,6 +71,9 @@ def kelly_criterion(
         side = "BUY"
         token_choice = "NO"
 
+    if price <= 0:
+        return None
+
     edge = p - price
     if edge < min_edge:
         return None

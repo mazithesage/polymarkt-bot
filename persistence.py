@@ -8,6 +8,7 @@ Handles: order history, position tracking, market metadata caching,
          and paper mode trade logging.
 """
 
+import fcntl
 import json
 import sqlite3
 import time
@@ -87,7 +88,9 @@ def init_db(db_path: str) -> None:
 
 @contextmanager
 def _connect(db_path: str):
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10.0)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -101,7 +104,34 @@ class PersistenceStore:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._lock_file = None
+        self._acquire_lock()
         init_db(db_path)
+
+    def _acquire_lock(self) -> None:
+        """Acquire an exclusive file lock to prevent multiple bot instances."""
+        lock_path = self.db_path + ".lock"
+        Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
+        self._lock_file = open(lock_path, "w")
+        try:
+            fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._lock_file.close()
+            self._lock_file = None
+            raise RuntimeError(
+                "Another bot instance is already running (could not acquire lock "
+                f"on {lock_path})"
+            )
+
+    def release_lock(self) -> None:
+        """Release the instance lock."""
+        if self._lock_file is not None:
+            try:
+                fcntl.flock(self._lock_file, fcntl.LOCK_UN)
+                self._lock_file.close()
+            except OSError:
+                pass
+            self._lock_file = None
 
     def log_order(
         self,

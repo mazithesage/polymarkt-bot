@@ -45,6 +45,40 @@ class BotConfig:
     order_type: str = "GTC"
     db_path: str = "data/bot.db"
     log_level: str = "INFO"
+    ssvi_r2_threshold: float = 0.70
+    slippage_spread_bps: int = 50
+    slippage_impact_bps: int = 10
+    http_timeout: float = 30.0
+    http_max_retries: int = 3
+
+    def __post_init__(self):
+        if not (0 < self.kelly_fraction <= 1):
+            raise ValueError(f"kelly_fraction must be in (0, 1], got {self.kelly_fraction}")
+        if self.scan_interval <= 0:
+            raise ValueError(f"scan_interval must be > 0, got {self.scan_interval}")
+        if self.max_position_usdc <= 0:
+            raise ValueError(f"max_position_usdc must be > 0, got {self.max_position_usdc}")
+        if not (0 < self.min_edge < 1):
+            raise ValueError(f"min_edge must be in (0, 1), got {self.min_edge}")
+        if self.max_markets <= 0:
+            raise ValueError(f"max_markets must be > 0, got {self.max_markets}")
+
+
+def validate_live_config(clob: ClobConfig, chain: ChainConfig, bot: BotConfig) -> None:
+    """Validate that live-mode configuration has required credentials."""
+    if bot.paper_mode:
+        return
+    errors = []
+    if not chain.private_key:
+        errors.append("PRIVATE_KEY is required for live trading")
+    if not clob.api_key:
+        errors.append("POLYMARKET_API_KEY is required for live trading")
+    if not clob.api_secret:
+        errors.append("POLYMARKET_API_SECRET is required for live trading")
+    if not clob.api_passphrase:
+        errors.append("POLYMARKET_API_PASSPHRASE is required for live trading")
+    if errors:
+        raise ValueError("Live mode config errors:\n  " + "\n  ".join(errors))
 
 
 def load_config() -> Tuple[ClobConfig, ChainConfig, BotConfig]:
@@ -68,5 +102,10 @@ def load_config() -> Tuple[ClobConfig, ChainConfig, BotConfig]:
         max_markets=int(os.getenv("MAX_MARKETS", "10")),
         db_path=os.getenv("DB_PATH", "data/bot.db"),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
+        ssvi_r2_threshold=float(os.getenv("SSVI_R2_THRESHOLD", "0.70")),
+        slippage_spread_bps=int(os.getenv("SLIPPAGE_SPREAD_BPS", "50")),
+        slippage_impact_bps=int(os.getenv("SLIPPAGE_IMPACT_BPS", "10")),
+        http_timeout=float(os.getenv("HTTP_TIMEOUT", "30.0")),
+        http_max_retries=int(os.getenv("HTTP_MAX_RETRIES", "3")),
     )
     return clob, chain, bot

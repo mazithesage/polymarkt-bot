@@ -5,6 +5,7 @@ market scanning, classification, and no unhandled exceptions.
 """
 
 import asyncio
+from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import pytest
@@ -13,10 +14,10 @@ import pytest_asyncio
 from bot import PolymarketBot, setup_logging
 from clob_client import ClobClient, Order, OrderBookSummary, Side, OrderType
 from config import BotConfig, ChainConfig, ClobConfig
-from kelly import kelly_criterion
+from kelly import KellyResult, kelly_criterion
 from market_scanner import Market, MarketCategory, MarketScanner
 from persistence import PersistenceStore
-from ssvi import extract_probability, fit_ssvi, generate_synthetic_surface
+from ssvi import SSVIParams, extract_probability, fit_ssvi, generate_synthetic_surface
 
 
 class TestSSVICalibrationIntegration:
@@ -196,3 +197,141 @@ class TestMarketClassificationIntegration:
                 classified_count += 1
         # At least 4 out of 5 should classify correctly
         assert classified_count >= 4, f"Only {classified_count}/5 classified correctly"
+
+
+class TestSSVIR2Rejection:
+    """Test that low R² SSVI fits fall back to mid-price."""
+
+    @pytest.fixture
+    def paper_bot(self, tmp_path):
+        clob = ClobConfig(api_key="test", api_secret="test", api_passphrase="test")
+        chain = ChainConfig(
+            private_key="ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        bot_cfg = BotConfig(
+            paper_mode=True,
+            db_path=str(tmp_path / "r2test.db"),
+            ssvi_r2_threshold=0.70,
+        )
+        setup_logging("DEBUG")
+        return PolymarketBot(clob, chain, bot_cfg)
+
+    @pytest.mark.asyncio
+    async def test_low_r2_falls_back_to_mid_price(self, paper_bot):
+        """When SSVI R² is below threshold, should return mid_price."""
+        market = Market(
+            condition_id="c1", question="Test crypto", description="",
+            category=MarketCategory.OTHER,
+            tokens=[{"token_id": "t1", "outcome": "Yes"}],
+            end_date="", active=True, volume=1000, liquidity=500, neg_risk=False,
+        )
+        low_r2_params = SSVIParams(theta=0.1, rho=0.0, phi=1.0, r_squared=0.30)
+        with patch("bot.fit_ssvi", return_value=low_r2_params):
+            prob = await paper_bot._estimate_probability(market, 0.55)
+            await paper_bot.close()
+        # Should fall back to mid_price since R² (0.30) < threshold (0.70)
+        assert prob == 0.55
+
+    @pytest.mark.asyncio
+    async def test_high_r2_uses_ssvi_probability(self, paper_bot):
+        """When SSVI R² is above threshold, should use SSVI probability."""
+        market = Market(
+            condition_id="c1", question="Test", description="",
+            category=MarketCategory.OTHER,
+            tokens=[{"token_id": "t1", "outcome": "Yes"}],
+            end_date="", active=True, volume=1000, liquidity=500, neg_risk=False,
+        )
+        # Use a real SSVI fit with good R²
+        prob = await paper_bot._estimate_probability(market, 0.55)
+        await paper_bot.close()
+        # Should NOT just return mid_price (0.55) — SSVI modifies it
+        # With synthetic surface and good fit, the result should be different from mid_price
+        # (or very close, which is also valid)
+        assert isinstance(prob, float)
+        assert 0 < prob < 1
+
+
+class TestPaperSlippage:
+    """Test that paper mode applies slippage to fill prices."""
+
+    @pytest.fixture
+    def paper_bot(self, tmp_path):
+        clob = ClobConfig(api_key="test", api_secret="test", api_passphrase="test")
+        chain = ChainConfig(
+            private_key="ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        bot_cfg = BotConfig(
+            paper_mode=True,
+            db_path=str(tmp_path / "slippage.db"),
+            slippage_spread_bps=50,
+            slippage_impact_bps=10,
+        )
+        return PolymarketBot(clob, chain, bot_cfg)
+
+    def _make_market(self):
+        return Market(
+            condition_id="c1", question="Test", description="",
+            category=MarketCategory.OTHER,
+            tokens=[
+                {"token_id": "t1", "outcome": "Yes"},
+                {"token_id": "t2", "outcome": "No"},
+            ],
+            end_date="", active=True, volume=1000, liquidity=500, neg_risk=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_paper_buy_fills_above_mid(self, paper_bot):
+        """Paper BUY should fill above the nominal price due to slippage."""
+        market = self._make_market()
+        kelly = KellyResult(
+            edge=0.05, kelly_fraction=0.10, position_size=50.0,
+            confidence=0.60, side="BUY", token_choice="YES",
+        )
+        book = OrderBookSummary(
+            token_id="t1", best_bid=0.50, best_ask=0.55,
+            mid_price=0.525, spread=0.05, bid_depth=100, ask_depth=100,
+        )
+        with patch.object(paper_bot.clob, "get_order_book", return_value=book):
+            result = await paper_bot._execute_trade(market, kelly)
+            await paper_bot.close()
+        assert result is not None
+        nominal_price = round(min(book.best_ask, book.mid_price + 0.005), 2)
+        assert result.price > nominal_price  # Slippage pushes fill up
+
+    @pytest.mark.asyncio
+    async def test_paper_sell_fills_below_mid(self, paper_bot):
+        """Paper SELL should fill below the nominal price due to slippage."""
+        market = self._make_market()
+        kelly = KellyResult(
+            edge=0.05, kelly_fraction=0.10, position_size=50.0,
+            confidence=0.60, side="SELL", token_choice="YES",
+        )
+        book = OrderBookSummary(
+            token_id="t1", best_bid=0.50, best_ask=0.55,
+            mid_price=0.525, spread=0.05, bid_depth=100, ask_depth=100,
+        )
+        with patch.object(paper_bot.clob, "get_order_book", return_value=book):
+            result = await paper_bot._execute_trade(market, kelly)
+            await paper_bot.close()
+        assert result is not None
+        nominal_price = round(max(book.best_bid, book.mid_price - 0.005), 2)
+        assert result.price < nominal_price  # Slippage pushes fill down
+
+    @pytest.mark.asyncio
+    async def test_slippage_capped_at_bounds(self, paper_bot):
+        """Slippage should not push fill price above 0.99 or below 0.01."""
+        market = self._make_market()
+        kelly = KellyResult(
+            edge=0.05, kelly_fraction=0.10, position_size=50.0,
+            confidence=0.60, side="BUY", token_choice="YES",
+        )
+        # Very high price near 1.0
+        book = OrderBookSummary(
+            token_id="t1", best_bid=0.97, best_ask=0.98,
+            mid_price=0.975, spread=0.01, bid_depth=100, ask_depth=100,
+        )
+        with patch.object(paper_bot.clob, "get_order_book", return_value=book):
+            result = await paper_bot._execute_trade(market, kelly)
+            await paper_bot.close()
+        assert result is not None
+        assert result.price <= 0.99

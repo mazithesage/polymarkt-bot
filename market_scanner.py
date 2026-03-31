@@ -10,6 +10,7 @@ by category, filtering for tradeable markets, and edge detection.
 """
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -17,6 +18,9 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 
 from config import ClobConfig
+from retry import retry_request
+
+logger = logging.getLogger("polymarket-bot")
 
 
 class MarketCategory(str, Enum):
@@ -132,10 +136,15 @@ class MarketScanner:
     def __init__(self, clob_config: ClobConfig):
         self.gamma_url = clob_config.gamma_url
         self._session: Optional[aiohttp.ClientSession] = None
+        self._semaphore = asyncio.Semaphore(5)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
+            connector = aiohttp.TCPConnector(limit=20, limit_per_host=10)
+            self._session = aiohttp.ClientSession(
+                timeout=timeout, connector=connector,
+            )
         return self._session
 
     async def close(self):
@@ -145,26 +154,63 @@ class MarketScanner:
     async def fetch_active_markets(
         self, limit: int = 100, min_liquidity: float = 0.0
     ) -> List[Market]:
-        """Fetch active markets from Gamma API."""
+        """Fetch active markets from Gamma API with pagination."""
         session = await self._get_session()
-        params = {
-            "active": "true",
-            "closed": "false",
-            "limit": str(limit),
-            "order": "volume",
-            "ascending": "false",
-        }
-        async with session.get(
-            f"{self.gamma_url}/markets", params=params
-        ) as resp:
-            if resp.status != 200:
-                return []
-            data = await resp.json()
+        all_markets: List[Market] = []
+        page_size = min(limit, 100)
+        max_pages = 20
+        offset = 0
 
-        markets = [_parse_market(m) for m in data]
+        for page in range(max_pages):
+            remaining = limit - len(all_markets)
+            if remaining <= 0:
+                break
+            fetch_size = min(page_size, remaining)
+
+            params = {
+                "active": "true",
+                "closed": "false",
+                "limit": str(fetch_size),
+                "offset": str(offset),
+                "order": "volume",
+                "ascending": "false",
+            }
+            try:
+                async with self._semaphore:
+                    resp = await retry_request(
+                        session, "GET", f"{self.gamma_url}/markets",
+                        params=params,
+                    )
+                    if resp.status != 200:
+                        logger.warning(
+                            f"Market fetch returned {resp.status} on page {page}"
+                        )
+                        break
+                    data = await resp.json()
+            except Exception as e:
+                logger.warning(
+                    f"Pagination failed on page {page}: {e}, "
+                    f"returning {len(all_markets)} markets collected so far"
+                )
+                break
+
+            if not data:
+                break
+
+            page_markets = [_parse_market(m) for m in data]
+            all_markets.extend(page_markets)
+            logger.debug(
+                f"Page {page}: fetched {len(page_markets)} markets "
+                f"(total: {len(all_markets)})"
+            )
+
+            if len(data) < fetch_size:
+                break
+            offset += len(data)
+
         if min_liquidity > 0:
-            markets = [m for m in markets if m.liquidity >= min_liquidity]
-        return markets
+            all_markets = [m for m in all_markets if m.liquidity >= min_liquidity]
+        return all_markets
 
     async def fetch_market_by_condition(self, condition_id: str) -> Optional[Market]:
         """Fetch a specific market by condition ID."""

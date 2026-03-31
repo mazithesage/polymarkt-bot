@@ -11,7 +11,9 @@ scanning -> classification -> probability estimation -> Kelly sizing -> executio
 
 import argparse
 import asyncio
+import dataclasses
 import logging
+import signal
 import sys
 import time
 import uuid
@@ -20,7 +22,7 @@ from typing import Optional
 import numpy as np
 
 from clob_client import ClobClient, Order, OrderResult, Side, OrderType
-from config import BotConfig, ChainConfig, ClobConfig, load_config
+from config import BotConfig, ChainConfig, ClobConfig, load_config, validate_live_config
 from kelly import KellyResult, check_position_limits, kelly_criterion
 from market_scanner import Market, MarketCategory, MarketScanner
 from persistence import PersistenceStore
@@ -107,12 +109,12 @@ class PolymarketBot:
                             current_exposure += result.position_size
                 except Exception as e:
                     msg = f"Error evaluating {market.question[:50]}: {e}"
-                    logger.warning(msg)
+                    logger.warning(msg, exc_info=True)
                     summary["errors"].append(msg)
 
         except Exception as e:
             msg = f"Scan cycle error: {e}"
-            logger.error(msg)
+            logger.error(msg, exc_info=True)
             summary["errors"].append(msg)
 
         self.store.log_scan(
@@ -198,6 +200,12 @@ class PolymarketBot:
                 spot=mid_price, base_vol=0.5, time_to_expiry=1.0 / 365
             )
             params = fit_ssvi(strikes, ivs, forward=mid_price, time_to_expiry=1.0 / 365)
+            if params.r_squared < self.config.ssvi_r2_threshold:
+                logger.info(
+                    f"SSVI R²={params.r_squared:.4f} below threshold "
+                    f"{self.config.ssvi_r2_threshold}, using mid-price"
+                )
+                return mid_price
             prob = extract_probability(
                 params, spot=mid_price, forward=mid_price, time_to_expiry=1.0 / 365
             )
@@ -221,6 +229,12 @@ class PolymarketBot:
         strikes = np.linspace(0.2, 0.8, len(prices))
         ivs = np.array([max(0.1, abs(p - 0.5) * 2 + 0.3) for p in prices])
         params = fit_ssvi(strikes, ivs, forward=0.5, time_to_expiry=1.0 / 365)
+        if params.r_squared < self.config.ssvi_r2_threshold:
+            logger.info(
+                f"Multi-token SSVI R²={params.r_squared:.4f} below threshold, "
+                f"falling back to mid-price"
+            )
+            return mid_price
         prob = extract_probability(params, spot=mid_price, forward=0.5, time_to_expiry=1.0 / 365)
         return prob.probability_above
 
@@ -244,34 +258,47 @@ class PolymarketBot:
         else:
             price = round(max(book.best_bid, book.mid_price - 0.005), 2)
 
+        # Validate price before Order construction
+        if price <= 0 or price >= 1:
+            return None
+
         size = round(kelly_result.position_size / price, 2) if price > 0 else 0
         if size <= 0:
             return None
 
-        order = Order(
-            token_id=token_id,
-            side=Side.BUY if kelly_result.side == "BUY" else Side.SELL,
-            price=price,
-            size=size,
-            order_type=OrderType.GTC,
-        )
-
         if self.config.paper_mode:
+            # Simulate slippage for realistic paper trading
+            spread_cost = self.config.slippage_spread_bps / 10_000
+            impact = self.config.slippage_impact_bps / 10_000 * size
+            if kelly_result.side == "BUY":
+                fill_price = min(price + spread_cost + impact, 0.99)
+            else:
+                fill_price = max(price - spread_cost - impact, 0.01)
+
             order_id = f"paper-{uuid.uuid4().hex[:12]}"
             result = OrderResult(
                 order_id=order_id,
                 status="PAPER_FILLED",
                 token_id=token_id,
                 side=kelly_result.side,
-                price=price,
+                price=fill_price,
                 size=size,
                 timestamp=time.time(),
             )
             logger.info(
-                f"[PAPER] Order: {kelly_result.side} {size} @ {price} "
+                f"[PAPER] Order: {kelly_result.side} {size} "
+                f"nominal={price:.4f} fill={fill_price:.4f} "
                 f"on {market.question[:40]}"
             )
         else:
+            order = Order(
+                token_id=token_id,
+                side=Side.BUY if kelly_result.side == "BUY" else Side.SELL,
+                price=price,
+                size=size,
+                order_type=OrderType.GTC,
+            )
+            fill_price = price
             result = await self.clob.submit_order(order)
             logger.info(
                 f"[LIVE] Order {result.order_id}: {result.status} "
@@ -284,7 +311,7 @@ class PolymarketBot:
             condition_id=market.condition_id,
             token_id=token_id,
             side=kelly_result.side,
-            price=price,
+            price=fill_price,
             size=size,
             status=result.status,
             paper_mode=self.config.paper_mode,
@@ -296,7 +323,7 @@ class PolymarketBot:
                 token_id=token_id,
                 token_choice=kelly_result.token_choice,
                 size=size,
-                avg_price=price,
+                avg_price=fill_price,
                 paper_mode=self.config.paper_mode,
             )
 
@@ -328,33 +355,29 @@ async def main():
 
     clob_config, chain_config, bot_config = load_config()
 
-    # Override paper mode from CLI
+    # Override from CLI using dataclasses.replace for cleanliness
+    overrides = {}
     if args.paper:
-        bot_config = BotConfig(
-            paper_mode=True,
-            scan_interval=bot_config.scan_interval,
-            max_position_usdc=bot_config.max_position_usdc,
-            kelly_fraction=bot_config.kelly_fraction,
-            min_edge=bot_config.min_edge,
-            max_markets=bot_config.max_markets,
-            db_path=bot_config.db_path,
-            log_level=args.log_level or bot_config.log_level,
-        )
+        overrides["paper_mode"] = True
     elif args.live:
-        bot_config = BotConfig(
-            paper_mode=False,
-            scan_interval=bot_config.scan_interval,
-            max_position_usdc=bot_config.max_position_usdc,
-            kelly_fraction=bot_config.kelly_fraction,
-            min_edge=bot_config.min_edge,
-            max_markets=bot_config.max_markets,
-            db_path=bot_config.db_path,
-            log_level=args.log_level or bot_config.log_level,
-        )
+        overrides["paper_mode"] = False
+    if args.log_level:
+        overrides["log_level"] = args.log_level
+    if overrides:
+        bot_config = dataclasses.replace(bot_config, **overrides)
 
-    setup_logging(args.log_level or bot_config.log_level)
+    setup_logging(bot_config.log_level)
+
+    # Validate credentials for live mode before starting
+    validate_live_config(clob_config, chain_config, bot_config)
 
     bot = PolymarketBot(clob_config, chain_config, bot_config)
+
+    # Graceful shutdown on SIGINT/SIGTERM
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda: _handle_shutdown(bot, loop))
+
     try:
         if args.once:
             summary = await bot.scan_once()
@@ -363,6 +386,13 @@ async def main():
             await bot.run_loop()
     finally:
         await bot.close()
+        bot.store.release_lock()
+
+
+def _handle_shutdown(bot: PolymarketBot, loop: asyncio.AbstractEventLoop) -> None:
+    """Handle SIGINT/SIGTERM gracefully."""
+    logger.info("Shutdown signal received, stopping bot...")
+    bot.stop()
 
 
 if __name__ == "__main__":

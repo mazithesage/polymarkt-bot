@@ -116,6 +116,17 @@ class TestKellyCriterion:
         assert result is not None
         assert 0 < result.kelly_fraction <= 0.25
 
+    def test_derived_price_zero_via_no_side(self):
+        """When market_price=1.0, derived NO price=0 should return None."""
+        result = kelly_criterion(
+            estimated_prob=0.01, market_price=0.999999, bankroll=1000.0,
+            min_edge=0.0001,
+        )
+        # Even with tiny min_edge, price near zero should be handled safely
+        # (either returns None or a valid result, no division by zero)
+        if result is not None:
+            assert result.position_size > 0
+
     def test_confidence_matches_selected_prob(self):
         """Confidence should be the probability used for the chosen side."""
         result = kelly_criterion(

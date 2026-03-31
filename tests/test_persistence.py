@@ -1,5 +1,6 @@
 """Tests for SQLite persistence module."""
 
+import sqlite3
 import time
 
 import pytest
@@ -10,7 +11,6 @@ from persistence import PersistenceStore, init_db
 class TestInitDB:
     def test_creates_database(self, db_path):
         init_db(db_path)
-        import sqlite3
         conn = sqlite3.connect(db_path)
         tables = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
@@ -26,6 +26,39 @@ class TestInitDB:
     def test_idempotent_init(self, db_path):
         init_db(db_path)
         init_db(db_path)  # Should not raise
+
+    def test_wal_mode_enabled(self, db_path):
+        store = PersistenceStore(db_path)
+        conn = sqlite3.connect(db_path)
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        conn.close()
+        store.release_lock()
+        assert mode == "wal"
+
+    def test_busy_timeout_set(self, db_path):
+        store = PersistenceStore(db_path)
+        conn = sqlite3.connect(db_path)
+        # busy_timeout is set per-connection in _connect, verify via a fresh _connect
+        from persistence import _connect
+        with _connect(db_path) as c:
+            timeout = c.execute("PRAGMA busy_timeout").fetchone()[0]
+        store.release_lock()
+        conn.close()
+        assert timeout == 5000
+
+
+class TestInstanceLock:
+    def test_second_instance_raises(self, db_path):
+        store1 = PersistenceStore(db_path)
+        with pytest.raises(RuntimeError, match="Another bot instance"):
+            PersistenceStore(db_path)
+        store1.release_lock()
+
+    def test_release_allows_reacquisition(self, db_path):
+        store1 = PersistenceStore(db_path)
+        store1.release_lock()
+        store2 = PersistenceStore(db_path)  # Should succeed
+        store2.release_lock()
 
 
 class TestOrderPersistence:

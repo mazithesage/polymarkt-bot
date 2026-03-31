@@ -7,9 +7,11 @@ Handles: API authentication (HMAC), order building, EIP-712 signing,
          order submission, and order book queries.
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -20,6 +22,9 @@ from eth_account import Account
 from eth_account.messages import encode_typed_data
 
 from config import ClobConfig, ChainConfig
+from retry import retry_request
+
+logger = logging.getLogger("polymarket-bot")
 
 
 class Side(str, Enum):
@@ -56,6 +61,12 @@ class Order:
     size: float
     order_type: OrderType = OrderType.GTC
     expiration: int = 0
+
+    def __post_init__(self):
+        if not (0 < self.price < 1):
+            raise ValueError(f"Order price must be in (0, 1), got {self.price}")
+        if self.size <= 0:
+            raise ValueError(f"Order size must be > 0, got {self.size}")
 
     def to_dict(self) -> dict:
         return {
@@ -198,10 +209,15 @@ class ClobClient:
         self.chain = chain_config
         self.base_url = clob_config.base_url
         self._session: Optional[aiohttp.ClientSession] = None
+        self._semaphore = asyncio.Semaphore(5)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
+            connector = aiohttp.TCPConnector(limit=20, limit_per_host=10)
+            self._session = aiohttp.ClientSession(
+                timeout=timeout, connector=connector,
+            )
         return self._session
 
     async def close(self):
@@ -219,15 +235,40 @@ class ClobClient:
         session = await self._get_session()
         path = f"/book?token_id={token_id}"
         headers = self._auth_headers("GET", path)
-        async with session.get(f"{self.base_url}{path}", headers=headers) as resp:
+        async with self._semaphore:
+            resp = await retry_request(
+                session, "GET", f"{self.base_url}{path}", headers=headers,
+            )
             data = await resp.json()
-        bids = data.get("bids", [])
-        asks = data.get("asks", [])
-        best_bid = float(bids[0]["price"]) if bids else 0.0
-        best_ask = float(asks[0]["price"]) if asks else 1.0
-        bid_depth = sum(float(b.get("size", 0)) for b in bids[:5])
-        ask_depth = sum(float(a.get("size", 0)) for a in asks[:5])
-        mid = (best_bid + best_ask) / 2
+
+        bids = data.get("bids", []) or []
+        asks = data.get("asks", []) or []
+
+        # Defensive price parsing
+        def _safe_price(entry: dict) -> Optional[float]:
+            try:
+                p = float(entry.get("price", ""))
+                return p if 0 <= p <= 1 else None
+            except (ValueError, TypeError):
+                return None
+
+        valid_bids = [b for b in bids if _safe_price(b) is not None]
+        valid_asks = [a for a in asks if _safe_price(a) is not None]
+
+        best_bid = float(valid_bids[0]["price"]) if valid_bids else 0.0
+        best_ask = float(valid_asks[0]["price"]) if valid_asks else 1.0
+
+        # Crossed book detection
+        if best_bid >= best_ask and valid_bids and valid_asks:
+            logger.warning(
+                f"Crossed order book for {token_id}: bid={best_bid} >= ask={best_ask}"
+            )
+            mid = (best_bid + best_ask) / 2
+        else:
+            mid = (best_bid + best_ask) / 2
+
+        bid_depth = sum(float(b.get("size", 0)) for b in valid_bids[:5])
+        ask_depth = sum(float(a.get("size", 0)) for a in valid_asks[:5])
         return OrderBookSummary(
             token_id=token_id,
             best_bid=best_bid,
@@ -265,9 +306,11 @@ class ClobClient:
         path = "/order"
         body = json.dumps(payload)
         headers = self._auth_headers("POST", path, body)
-        async with session.post(
-            f"{self.base_url}{path}", headers=headers, data=body
-        ) as resp:
+        async with self._semaphore:
+            resp = await retry_request(
+                session, "POST", f"{self.base_url}{path}",
+                headers=headers, data=body,
+            )
             data = await resp.json()
 
         return OrderResult(
@@ -285,7 +328,10 @@ class ClobClient:
         session = await self._get_session()
         path = f"/order/{order_id}"
         headers = self._auth_headers("DELETE", path)
-        async with session.delete(f"{self.base_url}{path}", headers=headers) as resp:
+        async with self._semaphore:
+            resp = await retry_request(
+                session, "DELETE", f"{self.base_url}{path}", headers=headers,
+            )
             return await resp.json()
 
     async def get_open_orders(self) -> List[Dict]:

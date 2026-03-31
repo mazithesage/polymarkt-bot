@@ -1,10 +1,17 @@
 """Tests for market scanning and classification logic."""
 
-import pytest
+import re
+from unittest.mock import patch
 
+import aiohttp
+import pytest
+from aioresponses import aioresponses
+
+from config import ClobConfig
 from market_scanner import (
     Market,
     MarketCategory,
+    MarketScanner,
     _parse_market,
     classify_market,
 )
@@ -156,3 +163,111 @@ class TestMarketProperties:
         )
         assert market.yes_token_id == ""
         assert market.no_token_id == ""
+
+
+def _make_raw_market(i: int) -> dict:
+    """Helper to create a raw market dict for pagination tests."""
+    return {
+        "condition_id": f"cond-{i}",
+        "question": f"Market {i}?",
+        "description": "",
+        "tokens": [
+            {"token_id": f"t{i}-yes", "outcome": "Yes"},
+            {"token_id": f"t{i}-no", "outcome": "No"},
+        ],
+        "end_date_iso": "2025-12-31",
+        "active": True,
+        "closed": False,
+        "volume": 1000 - i,
+        "liquidity": 500.0,
+        "neg_risk": False,
+    }
+
+
+GAMMA_URL = "https://gamma-api.polymarket.com"
+# Regex pattern to match the markets endpoint with any query params
+MARKETS_PATTERN = re.compile(r"^https://gamma-api\.polymarket\.com/markets")
+
+
+async def _noop_sleep(delay):
+    pass
+
+
+def _make_scanner():
+    """Create a scanner with a simple session for test compatibility."""
+    config = ClobConfig(gamma_url=GAMMA_URL)
+    scanner = MarketScanner(config)
+    return scanner
+
+
+@pytest.mark.asyncio
+class TestMarketScannerPagination:
+    async def test_single_page(self):
+        scanner = _make_scanner()
+        with aioresponses() as m, patch("retry.asyncio.sleep", side_effect=_noop_sleep):
+            m.get(MARKETS_PATTERN,
+                  payload=[_make_raw_market(i) for i in range(5)])
+            scanner._session = aiohttp.ClientSession()
+            markets = await scanner.fetch_active_markets(limit=5)
+            await scanner.close()
+        assert len(markets) == 5
+
+    async def test_multi_page_aggregation(self):
+        scanner = _make_scanner()
+        with aioresponses() as m, patch("retry.asyncio.sleep", side_effect=_noop_sleep):
+            m.get(MARKETS_PATTERN,
+                  payload=[_make_raw_market(i) for i in range(100)])
+            m.get(MARKETS_PATTERN,
+                  payload=[_make_raw_market(100 + i) for i in range(50)])
+            scanner._session = aiohttp.ClientSession()
+            markets = await scanner.fetch_active_markets(limit=200)
+            await scanner.close()
+        assert len(markets) == 150
+
+    async def test_empty_first_page(self):
+        scanner = _make_scanner()
+        with aioresponses() as m, patch("retry.asyncio.sleep", side_effect=_noop_sleep):
+            m.get(MARKETS_PATTERN, payload=[])
+            scanner._session = aiohttp.ClientSession()
+            markets = await scanner.fetch_active_markets(limit=100)
+            await scanner.close()
+        assert len(markets) == 0
+
+    async def test_limit_respected(self):
+        scanner = _make_scanner()
+        with aioresponses() as m, patch("retry.asyncio.sleep", side_effect=_noop_sleep):
+            m.get(MARKETS_PATTERN,
+                  payload=[_make_raw_market(i) for i in range(10)])
+            scanner._session = aiohttp.ClientSession()
+            markets = await scanner.fetch_active_markets(limit=10)
+            await scanner.close()
+        assert len(markets) <= 10
+
+    async def test_api_failure_mid_pagination(self):
+        scanner = _make_scanner()
+        with aioresponses() as m, patch("retry.asyncio.sleep", side_effect=_noop_sleep):
+            # Page 1 succeeds
+            m.get(MARKETS_PATTERN,
+                  payload=[_make_raw_market(i) for i in range(100)])
+            # Page 2 fails — provide enough mocks for retries (max_retries=3 + 1)
+            for _ in range(4):
+                m.get(MARKETS_PATTERN,
+                      exception=aiohttp.ClientConnectionError())
+            scanner._session = aiohttp.ClientSession()
+            markets = await scanner.fetch_active_markets(limit=200)
+            await scanner.close()
+        # Should return what was collected from page 1
+        assert len(markets) == 100
+
+    async def test_max_pages_cap(self):
+        """Scanner should stop after max_pages even if more data exists."""
+        scanner = _make_scanner()
+        with aioresponses() as m, patch("retry.asyncio.sleep", side_effect=_noop_sleep):
+            for _ in range(25):
+                m.get(MARKETS_PATTERN,
+                      payload=[_make_raw_market(i) for i in range(5)])
+            scanner._session = aiohttp.ClientSession()
+            markets = await scanner.fetch_active_markets(limit=10000)
+            await scanner.close()
+        # max_pages=20, 5 per page = 100 max
+        assert len(markets) <= 100

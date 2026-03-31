@@ -1,0 +1,99 @@
+"""Tests for config validation and load_config."""
+
+import pytest
+
+from config import BotConfig, ChainConfig, ClobConfig, validate_live_config
+
+
+class TestBotConfigValidation:
+    def test_defaults_are_valid(self):
+        cfg = BotConfig()
+        assert cfg.kelly_fraction == 0.25
+
+    def test_kelly_fraction_zero_rejected(self):
+        with pytest.raises(ValueError, match="kelly_fraction"):
+            BotConfig(kelly_fraction=0.0)
+
+    def test_kelly_fraction_negative_rejected(self):
+        with pytest.raises(ValueError, match="kelly_fraction"):
+            BotConfig(kelly_fraction=-0.1)
+
+    def test_kelly_fraction_above_one_rejected(self):
+        with pytest.raises(ValueError, match="kelly_fraction"):
+            BotConfig(kelly_fraction=1.5)
+
+    def test_kelly_fraction_one_allowed(self):
+        cfg = BotConfig(kelly_fraction=1.0)
+        assert cfg.kelly_fraction == 1.0
+
+    def test_scan_interval_zero_rejected(self):
+        with pytest.raises(ValueError, match="scan_interval"):
+            BotConfig(scan_interval=0)
+
+    def test_scan_interval_negative_rejected(self):
+        with pytest.raises(ValueError, match="scan_interval"):
+            BotConfig(scan_interval=-10)
+
+    def test_max_position_usdc_zero_rejected(self):
+        with pytest.raises(ValueError, match="max_position_usdc"):
+            BotConfig(max_position_usdc=0.0)
+
+    def test_max_position_usdc_negative_rejected(self):
+        with pytest.raises(ValueError, match="max_position_usdc"):
+            BotConfig(max_position_usdc=-50.0)
+
+    def test_min_edge_zero_rejected(self):
+        with pytest.raises(ValueError, match="min_edge"):
+            BotConfig(min_edge=0.0)
+
+    def test_min_edge_one_rejected(self):
+        with pytest.raises(ValueError, match="min_edge"):
+            BotConfig(min_edge=1.0)
+
+    def test_min_edge_negative_rejected(self):
+        with pytest.raises(ValueError, match="min_edge"):
+            BotConfig(min_edge=-0.01)
+
+    def test_max_markets_zero_rejected(self):
+        with pytest.raises(ValueError, match="max_markets"):
+            BotConfig(max_markets=0)
+
+    def test_max_markets_negative_rejected(self):
+        with pytest.raises(ValueError, match="max_markets"):
+            BotConfig(max_markets=-1)
+
+    def test_new_fields_have_defaults(self):
+        cfg = BotConfig()
+        assert cfg.ssvi_r2_threshold == 0.70
+        assert cfg.slippage_spread_bps == 50
+        assert cfg.slippage_impact_bps == 10
+        assert cfg.http_timeout == 30.0
+        assert cfg.http_max_retries == 3
+
+
+class TestValidateLiveConfig:
+    def test_paper_mode_always_passes(self):
+        clob = ClobConfig()
+        chain = ChainConfig()
+        bot = BotConfig(paper_mode=True)
+        validate_live_config(clob, chain, bot)  # Should not raise
+
+    def test_live_mode_missing_all_raises(self):
+        clob = ClobConfig()
+        chain = ChainConfig()
+        bot = BotConfig(paper_mode=False)
+        with pytest.raises(ValueError, match="PRIVATE_KEY"):
+            validate_live_config(clob, chain, bot)
+
+    def test_live_mode_with_credentials_passes(self):
+        clob = ClobConfig(api_key="k", api_secret="s", api_passphrase="p")
+        chain = ChainConfig(private_key="0xdeadbeef")
+        bot = BotConfig(paper_mode=False)
+        validate_live_config(clob, chain, bot)  # Should not raise
+
+    def test_live_mode_missing_api_key_raises(self):
+        clob = ClobConfig(api_secret="s", api_passphrase="p")
+        chain = ChainConfig(private_key="0xdeadbeef")
+        bot = BotConfig(paper_mode=False)
+        with pytest.raises(ValueError, match="API_KEY"):
+            validate_live_config(clob, chain, bot)
