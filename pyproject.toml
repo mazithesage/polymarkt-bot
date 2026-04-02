@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "polymarkt-bot"
+version = "0.2.0"
+description = "Quantitative trading bot for Polymarket prediction markets"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9",
+    "eth-account>=0.11",
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "web3>=6.15",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "aioresponses>=0.7.6",
+    "ruff>=0.3",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM"]
+ignore = [
+    "E501",   # line length — ruff format handles this
+    "SIM108", # ternary operators aren't always clearer
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "bot", "clob_client", "config", "kelly",
+    "market_scanner", "persistence", "redemption", "retry", "ssvi",
+]

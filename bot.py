@@ -1,12 +1,5 @@
 """
-Main bot orchestrator - async scanning loop with paper mode support.
-Sourced from: Polymarket/poly-market-maker (main loop structure),
-              Jonmaa/btc-polymarket-bot (BTC market strategy),
-              realfishsam/prediction-market-arbitrage-bot (edge detection loop),
-              demone456/kalshi-polymarket-bot (multi-platform orchestration).
-
-This is the entry point that ties together all modules:
-scanning -> classification -> probability estimation -> Kelly sizing -> execution.
+Main bot — async scan loop, SSVI probability estimation, Kelly sizing, paper/live execution.
 """
 
 import argparse
@@ -35,6 +28,12 @@ from ssvi import (
 
 logger = logging.getLogger("polymarket-bot")
 
+# Thresholds for market filtering
+MIN_TRADEABLE_PRICE = 0.01
+MAX_TRADEABLE_PRICE = 0.99
+MAX_SPREAD = 0.10
+BANKROLL_MULTIPLIER = 10  # bankroll = 10x max position is a rough heuristic, not portfolio theory
+
 
 def setup_logging(level: str = "INFO") -> None:
     logging.basicConfig(
@@ -45,7 +44,6 @@ def setup_logging(level: str = "INFO") -> None:
 
 
 class PolymarketBot:
-    """Main bot class that orchestrates the scanning/trading loop."""
 
     def __init__(
         self,
@@ -60,23 +58,47 @@ class PolymarketBot:
         self.clob = ClobClient(clob_config, chain_config)
         self.store = PersistenceStore(bot_config.db_path)
         self._running = False
+        # Circuit breaker state
+        self._consecutive_failures = 0
+        self._circuit_breaker_until: float = 0.0
 
     async def close(self):
         await self.scanner.close()
         await self.clob.close()
 
-    async def scan_once(self) -> dict:
-        """
-        Run a single scan cycle:
-        1. Fetch active markets
-        2. Classify and filter
-        3. Get order books
-        4. Estimate probabilities (SSVI or simple)
-        5. Apply Kelly sizing
-        6. Place orders (or log in paper mode)
+    def _trip_circuit_breaker(self) -> None:
+        self._circuit_breaker_until = time.time() + self.config.circuit_breaker_cooldown
+        logger.warning(
+            "Circuit breaker tripped after %d consecutive failures. "
+            "Pausing for %ds.",
+            self._consecutive_failures,
+            self.config.circuit_breaker_cooldown,
+        )
 
-        Returns summary dict of the scan.
-        """
+    def _reset_circuit_breaker(self) -> None:
+        if self._consecutive_failures > 0:
+            logger.info("Circuit breaker reset — scan succeeded.")
+        self._consecutive_failures = 0
+        self._circuit_breaker_until = 0.0
+
+    def _circuit_breaker_active(self) -> bool:
+        if self._circuit_breaker_until <= 0:
+            return False
+        if time.time() >= self._circuit_breaker_until:
+            logger.info("Circuit breaker cooldown expired, resuming.")
+            self._consecutive_failures = 0
+            self._circuit_breaker_until = 0.0
+            return False
+        return True
+
+    async def scan_once(self) -> dict:
+        """Single scan cycle: discover -> evaluate -> size -> execute."""
+        if self._circuit_breaker_active():
+            remaining = self._circuit_breaker_until - time.time()
+            logger.info("Circuit breaker active, %.0fs remaining. Skipping scan.", remaining)
+            return {"markets_found": 0, "markets_with_edge": 0,
+                    "orders_placed": 0, "errors": ["circuit_breaker_active"]}
+
         logger.info("Starting scan cycle...")
         summary = {
             "markets_found": 0,
@@ -94,7 +116,7 @@ class PolymarketBot:
             logger.info(f"Found {len(markets)} active markets")
 
             current_exposure = self.store.get_total_exposure(self.config.paper_mode)
-            bankroll = self.config.max_position_usdc * 10  # Simple bankroll estimate
+            bankroll = self.config.max_position_usdc * BANKROLL_MULTIPLIER
 
             for market in markets[: self.config.max_markets]:
                 try:
@@ -112,10 +134,16 @@ class PolymarketBot:
                     logger.warning(msg, exc_info=True)
                     summary["errors"].append(msg)
 
+            # Scan completed — reset circuit breaker
+            self._reset_circuit_breaker()
+
         except Exception as e:
             msg = f"Scan cycle error: {e}"
             logger.error(msg, exc_info=True)
             summary["errors"].append(msg)
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self.config.max_consecutive_failures:
+                self._trip_circuit_breaker()
 
         self.store.log_scan(
             markets_found=summary["markets_found"],
@@ -134,23 +162,19 @@ class PolymarketBot:
     async def _evaluate_market(
         self, market: Market, bankroll: float, current_exposure: float
     ) -> Optional[KellyResult]:
-        """Evaluate a market for trading opportunity using SSVI + Kelly."""
         if not market.yes_token_id:
             return None
 
-        # Get order book for YES token
         book = await self.clob.get_order_book(market.yes_token_id)
         market_price = book.mid_price
 
-        if market_price <= 0.01 or market_price >= 0.99:
+        if market_price <= MIN_TRADEABLE_PRICE or market_price >= MAX_TRADEABLE_PRICE:
             return None
-        if book.spread > 0.10:
+        if book.spread > MAX_SPREAD:
             return None
 
-        # Estimate probability using SSVI or fall back to order book
         estimated_prob = await self._estimate_probability(market, book.mid_price)
 
-        # Apply Kelly sizing
         result = kelly_criterion(
             estimated_prob=estimated_prob,
             market_price=market_price,
@@ -163,7 +187,6 @@ class PolymarketBot:
         if result is None:
             return None
 
-        # Check position limits
         adjusted_size = check_position_limits(
             current_exposure, result.position_size,
             self.config.max_position_usdc * 5,
@@ -182,19 +205,14 @@ class PolymarketBot:
     async def _estimate_probability(
         self, market: Market, mid_price: float
     ) -> float:
-        """
-        Estimate true probability for a market.
-        Uses SSVI calibration if multiple strike-like data points are available,
-        otherwise falls back to a simple mid-price adjustment.
-        """
-        # For crypto BTC-style markets with multiple strikes, try SSVI
+        # For crypto markets with multiple strikes, try SSVI on real data
         if market.category == MarketCategory.CRYPTO and len(market.tokens) >= 3:
             try:
                 return await self._ssvi_probability(market, mid_price)
             except Exception as e:
                 logger.debug(f"SSVI failed, using fallback: {e}")
 
-        # Fallback: use synthetic surface for demonstration / paper mode
+        # Fallback: synthetic surface (paper mode / demo)
         try:
             strikes, ivs = generate_synthetic_surface(
                 spot=mid_price, base_vol=0.5, time_to_expiry=1.0 / 365
@@ -214,7 +232,6 @@ class PolymarketBot:
             return mid_price
 
     async def _ssvi_probability(self, market: Market, mid_price: float) -> float:
-        """Attempt SSVI probability estimation from multiple related tokens."""
         prices = []
         for token in market.tokens:
             try:
@@ -241,7 +258,6 @@ class PolymarketBot:
     async def _execute_trade(
         self, market: Market, kelly_result: KellyResult
     ) -> Optional[OrderResult]:
-        """Execute a trade based on Kelly sizing result."""
         token_id = (
             market.yes_token_id
             if kelly_result.token_choice == "YES"
@@ -250,15 +266,12 @@ class PolymarketBot:
         if not token_id:
             return None
 
-        # Get current best price for limit order
         book = await self.clob.get_order_book(token_id)
         if kelly_result.side == "BUY":
-            # Place limit buy slightly below best ask
             price = round(min(book.best_ask, book.mid_price + 0.005), 2)
         else:
             price = round(max(book.best_bid, book.mid_price - 0.005), 2)
 
-        # Validate price before Order construction
         if price <= 0 or price >= 1:
             return None
 
@@ -267,7 +280,6 @@ class PolymarketBot:
             return None
 
         if self.config.paper_mode:
-            # Simulate slippage for realistic paper trading
             spread_cost = self.config.slippage_spread_bps / 10_000
             impact = self.config.slippage_impact_bps / 10_000 * size
             if kelly_result.side == "BUY":
@@ -277,16 +289,12 @@ class PolymarketBot:
 
             order_id = f"paper-{uuid.uuid4().hex[:12]}"
             result = OrderResult(
-                order_id=order_id,
-                status="PAPER_FILLED",
-                token_id=token_id,
-                side=kelly_result.side,
-                price=fill_price,
-                size=size,
-                timestamp=time.time(),
+                order_id=order_id, status="PAPER_FILLED",
+                token_id=token_id, side=kelly_result.side,
+                price=fill_price, size=size, timestamp=time.time(),
             )
             logger.info(
-                f"[PAPER] Order: {kelly_result.side} {size} "
+                f"[PAPER] {kelly_result.side} {size} "
                 f"nominal={price:.4f} fill={fill_price:.4f} "
                 f"on {market.question[:40]}"
             )
@@ -294,9 +302,7 @@ class PolymarketBot:
             order = Order(
                 token_id=token_id,
                 side=Side.BUY if kelly_result.side == "BUY" else Side.SELL,
-                price=price,
-                size=size,
-                order_type=OrderType.GTC,
+                price=price, size=size, order_type=OrderType.GTC,
             )
             fill_price = price
             result = await self.clob.submit_order(order)
@@ -305,32 +311,23 @@ class PolymarketBot:
                 f"{kelly_result.side} {size} @ {price}"
             )
 
-        # Persist
         self.store.log_order(
-            order_id=result.order_id,
-            condition_id=market.condition_id,
-            token_id=token_id,
-            side=kelly_result.side,
-            price=fill_price,
-            size=size,
-            status=result.status,
+            order_id=result.order_id, condition_id=market.condition_id,
+            token_id=token_id, side=kelly_result.side,
+            price=fill_price, size=size, status=result.status,
             paper_mode=self.config.paper_mode,
         )
 
         if "FILLED" in result.status or "PAPER" in result.status:
             self.store.upsert_position(
-                condition_id=market.condition_id,
-                token_id=token_id,
-                token_choice=kelly_result.token_choice,
-                size=size,
-                avg_price=fill_price,
-                paper_mode=self.config.paper_mode,
+                condition_id=market.condition_id, token_id=token_id,
+                token_choice=kelly_result.token_choice, size=size,
+                avg_price=fill_price, paper_mode=self.config.paper_mode,
             )
 
         return result
 
     async def run_loop(self) -> None:
-        """Run continuous scanning loop."""
         self._running = True
         logger.info(
             f"Bot started in {'PAPER' if self.config.paper_mode else 'LIVE'} mode. "
@@ -355,7 +352,6 @@ async def main():
 
     clob_config, chain_config, bot_config = load_config()
 
-    # Override from CLI using dataclasses.replace for cleanliness
     overrides = {}
     if args.paper:
         overrides["paper_mode"] = True
@@ -367,13 +363,10 @@ async def main():
         bot_config = dataclasses.replace(bot_config, **overrides)
 
     setup_logging(bot_config.log_level)
-
-    # Validate credentials for live mode before starting
     validate_live_config(clob_config, chain_config, bot_config)
 
     bot = PolymarketBot(clob_config, chain_config, bot_config)
 
-    # Graceful shutdown on SIGINT/SIGTERM
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: _handle_shutdown(bot, loop))
@@ -390,7 +383,6 @@ async def main():
 
 
 def _handle_shutdown(bot: PolymarketBot, loop: asyncio.AbstractEventLoop) -> None:
-    """Handle SIGINT/SIGTERM gracefully."""
     logger.info("Shutdown signal received, stopping bot...")
     bot.stop()
 

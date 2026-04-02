@@ -1,28 +1,54 @@
-"""
-SQLite persistence module for bot state, orders, and positions.
-Sourced from: perpetual-s/polymarket-python-infrastructure (multi-wallet state),
-              Jonmaa/btc-polymarket-bot (trade logging),
-              demone456/kalshi-polymarket-bot (position tracking).
+"""SQLite persistence — orders, positions, market cache, scan log."""
 
-Handles: order history, position tracking, market metadata caching,
-         and paper mode trade logging.
-"""
-
-import fcntl
 import json
 import sqlite3
 import time
 from contextlib import contextmanager
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+BUSY_TIMEOUT_MS = 5000
+CONNECT_TIMEOUT_S = 10.0
+CURRENT_SCHEMA_VERSION = 1
+
+# Platform-aware file locking
+try:
+    import fcntl
+
+    def _lock_exclusive(f):
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock(f):
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+except ImportError:
+    # Windows fallback — msvcrt.locking is advisory but good enough
+    try:
+        import msvcrt
+
+        def _lock_exclusive(f):
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+
+        def _unlock(f):
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+
+    except ImportError:
+        raise RuntimeError(
+            "No file-locking module available (need fcntl on Unix or msvcrt on Windows)"
+        )
+
 
 def init_db(db_path: str) -> None:
-    """Initialize the SQLite database with required tables."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with _connect(db_path) as conn:
         conn.executescript("""
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 order_id TEXT UNIQUE,
@@ -84,12 +110,26 @@ def init_db(db_path: str) -> None:
             CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
             CREATE INDEX IF NOT EXISTS idx_positions_condition ON positions(condition_id);
         """)
+        _ensure_schema_version(conn)
+
+
+def _ensure_schema_version(conn: sqlite3.Connection) -> None:
+    """Check schema version and run migrations if needed."""
+    row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+    if row is None:
+        conn.execute("INSERT INTO schema_version (version) VALUES (?)",
+                      (CURRENT_SCHEMA_VERSION,))
+        return
+    db_version = row[0]
+    if db_version < CURRENT_SCHEMA_VERSION:
+        # Future migrations go here: if db_version < 2: _migrate_v1_to_v2(conn)
+        conn.execute("UPDATE schema_version SET version = ?", (CURRENT_SCHEMA_VERSION,))
 
 
 @contextmanager
 def _connect(db_path: str):
-    conn = sqlite3.connect(db_path, timeout=10.0)
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn = sqlite3.connect(db_path, timeout=CONNECT_TIMEOUT_S)
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     try:
@@ -100,7 +140,6 @@ def _connect(db_path: str):
 
 
 class PersistenceStore:
-    """SQLite-backed persistence for the bot."""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -109,12 +148,11 @@ class PersistenceStore:
         init_db(db_path)
 
     def _acquire_lock(self) -> None:
-        """Acquire an exclusive file lock to prevent multiple bot instances."""
         lock_path = self.db_path + ".lock"
         Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock_file = open(lock_path, "w")
         try:
-            fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_exclusive(self._lock_file)
         except OSError:
             self._lock_file.close()
             self._lock_file = None
@@ -124,10 +162,9 @@ class PersistenceStore:
             )
 
     def release_lock(self) -> None:
-        """Release the instance lock."""
         if self._lock_file is not None:
             try:
-                fcntl.flock(self._lock_file, fcntl.LOCK_UN)
+                _unlock(self._lock_file)
                 self._lock_file.close()
             except OSError:
                 pass
@@ -203,7 +240,8 @@ class PersistenceStore:
     def get_total_exposure(self, paper_mode: bool = False) -> float:
         with _connect(self.db_path) as conn:
             row = conn.execute(
-                "SELECT COALESCE(SUM(size * avg_price), 0) as total FROM positions WHERE size > 0 AND paper_mode=?",
+                "SELECT COALESCE(SUM(size * avg_price), 0) as total "
+                "FROM positions WHERE size > 0 AND paper_mode=?",
                 (int(paper_mode),),
             ).fetchone()
             return float(row["total"])

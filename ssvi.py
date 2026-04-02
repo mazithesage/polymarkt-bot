@@ -1,13 +1,9 @@
 """
-SSVI (Surface Stochastic Volatility Inspired) fitting and probability extraction.
-Sourced from: Polymarket/poly-market-maker (implied vol / probability estimation),
-              ThinkEnigmatic/polymarket-bot-arena (signal processing),
-              JonathanPetersonn/oracle-lag-sniper (price analysis).
+SSVI surface fitting and risk-neutral probability extraction.
 
-SSVI is used to model the implied volatility surface and extract
-risk-neutral probabilities from market prices. For prediction markets,
-we adapt it to extract the probability that a price will be above a
-given level at expiry.
+References:
+  Gatheral & Jacquier (2014), "Arbitrage-free SVI volatility surfaces"
+  Gatheral (2004), "A parsimonious arbitrage-free implied volatility parameterization"
 """
 
 import math
@@ -17,6 +13,11 @@ from typing import Optional, Tuple
 import numpy as np
 from scipy.optimize import minimize
 from scipy.stats import norm
+
+# Bounds on fitted parameters
+MIN_VARIANCE = 1e-6
+MAX_VARIANCE_BOUND = 10.0
+RHO_BOUND = 0.99
 
 
 @dataclass
@@ -37,14 +38,7 @@ class ProbabilityEstimate:
 
 def ssvi_total_variance(k: np.ndarray, theta: float, rho: float, phi: float) -> np.ndarray:
     """
-    SSVI parameterization of total implied variance w(k).
-    w(k) = (theta / 2) * (1 + rho * phi * k + sqrt((phi * k + rho)^2 + (1 - rho^2)))
-
-    Args:
-        k: log-moneyness array (log(K/F))
-        theta: ATM total variance (> 0)
-        rho: correlation parameter (-1, 1)
-        phi: curvature parameter (> 0)
+    SSVI total variance: w(k) = (theta/2)(1 + rho*phi*k + sqrt((phi*k + rho)^2 + 1 - rho^2))
     """
     disc = np.sqrt((phi * k + rho) ** 2 + (1 - rho**2))
     return (theta / 2) * (1 + rho * phi * k + disc)
@@ -56,22 +50,10 @@ def fit_ssvi(
     forward: float,
     time_to_expiry: float,
 ) -> SSVIParams:
-    """
-    Fit SSVI parameters to observed implied volatilities.
-
-    Args:
-        strikes: Array of strike prices
-        implied_vols: Array of implied volatilities corresponding to strikes
-        forward: Forward price
-        time_to_expiry: Time to expiry in years
-
-    Returns:
-        Fitted SSVIParams with R² goodness-of-fit.
-    """
+    """Fit SSVI params to observed IVs. Returns fitted params with R^2."""
     if len(strikes) < 3 or time_to_expiry <= 0:
         raise ValueError("Need at least 3 strikes and positive time to expiry")
 
-    # Compute log-moneyness and total variance targets
     k = np.log(strikes / forward)
     total_var_target = (implied_vols ** 2) * time_to_expiry
 
@@ -84,41 +66,64 @@ def fit_ssvi(
             return 1e10
         return np.sum((w_model - total_var_target) ** 2)
 
-    # Initial guess based on data characteristics
+    bounds = [(MIN_VARIANCE, MAX_VARIANCE_BOUND), (-RHO_BOUND, RHO_BOUND),
+              (MIN_VARIANCE, MAX_VARIANCE_BOUND)]
+
+    # --- data-driven initial guess ---
     atm_var = float(np.mean(implied_vols ** 2) * time_to_expiry)
-    bounds = [(1e-6, 10.0), (-0.99, 0.99), (1e-6, 10.0)]
+    theta0 = max(atm_var, MIN_VARIANCE)
 
-    # Try multiple starting points to avoid local minima
+    # Estimate rho from smile skew: regress total_var on k for a rough slope
+    if len(k) >= 3 and np.std(k) > 1e-8:
+        slope = float(np.polyfit(k, total_var_target, 1)[0])
+        # rho ~ slope / (theta * phi), but we don't know phi yet — just use sign + magnitude
+        rho0 = float(np.clip(slope / max(atm_var, 0.01), -0.8, 0.8))
+    else:
+        rho0 = 0.0
+
+    # Estimate phi from wing curvature
+    if len(k) >= 5:
+        coeffs = np.polyfit(k, total_var_target, 2)
+        curvature = float(coeffs[0])
+        phi0 = float(np.clip(abs(curvature) / max(atm_var * 0.5, 1e-4), 0.1, 5.0))
+    else:
+        phi0 = 1.0
+
+    x0 = [theta0, rho0, phi0]
+
+    # Primary pass — L-BFGS-B with data-driven init
     best_result = None
-    best_cost = float("inf")
-    for theta0 in [atm_var, atm_var * 0.5, atm_var * 2.0, 0.01, 0.1]:
-        for rho0 in [-0.5, 0.0, 0.5]:
-            for phi0 in [0.1, 0.5, 1.0, 2.0]:
-                x0 = [max(theta0, 1e-6), rho0, phi0]
-                try:
-                    result = minimize(
-                        objective, x0, method="L-BFGS-B", bounds=bounds,
-                        options={"maxiter": 500},
-                    )
-                    if result.fun < best_cost:
-                        best_cost = result.fun
-                        best_result = result
-                except Exception:
-                    continue
+    try:
+        best_result = minimize(objective, x0, method="L-BFGS-B", bounds=bounds,
+                               options={"maxiter": 500})
+    except Exception:
+        pass
 
+    # If first pass failed or got stuck, perturb and retry once
+    if best_result is None or best_result.fun > 1e-4:
+        perturbed = [theta0 * 1.5, rho0 * 0.5, phi0 * 2.0]
+        perturbed = [max(MIN_VARIANCE, perturbed[0]), np.clip(perturbed[1], -0.8, 0.8),
+                     max(MIN_VARIANCE, perturbed[2])]
+        try:
+            result2 = minimize(objective, perturbed, method="L-BFGS-B", bounds=bounds,
+                               options={"maxiter": 500})
+            if best_result is None or result2.fun < best_result.fun:
+                best_result = result2
+        except Exception:
+            pass
+
+    # Last resort — Nelder-Mead (unbounded, slower, but robust)
     if best_result is None:
-        # Fallback with Nelder-Mead
-        x0 = [max(atm_var, 0.01), 0.0, 1.0]
-        best_result = minimize(objective, x0, method="Nelder-Mead",
+        x0_fallback = [max(atm_var, 0.01), 0.0, 1.0]
+        best_result = minimize(objective, x0_fallback, method="Nelder-Mead",
                                options={"maxiter": 2000})
 
     theta, rho, phi = best_result.x
-    # Clamp parameters
-    theta = max(theta, 1e-6)
-    phi = max(phi, 1e-6)
-    rho = max(-0.99, min(0.99, rho))
+    theta = max(theta, MIN_VARIANCE)
+    phi = max(phi, MIN_VARIANCE)
+    rho = max(-RHO_BOUND, min(RHO_BOUND, rho))
 
-    # Compute R²
+    # R^2
     w_fitted = ssvi_total_variance(k, theta, rho, phi)
     ss_res = np.sum((total_var_target - w_fitted) ** 2)
     ss_tot = np.sum((total_var_target - np.mean(total_var_target)) ** 2)
@@ -135,28 +140,16 @@ def extract_probability(
     strike: Optional[float] = None,
 ) -> ProbabilityEstimate:
     """
-    Extract risk-neutral probability from SSVI parameters.
-
-    For prediction markets, the probability that the underlying
-    will be above the strike at expiry. Uses Black-Scholes-style
-    probability calculation with SSVI-implied volatility.
-
-    Args:
-        params: Fitted SSVI parameters
-        spot: Current spot price (or market mid-price for prediction markets)
-        forward: Forward price
-        time_to_expiry: Time to expiry in years
-        strike: Strike price (defaults to spot for ATM probability)
+    Risk-neutral P(S_T > K) via Black-Scholes with SSVI-implied vol.
+    Defaults to ATM (strike=spot) if no strike given.
     """
     if strike is None:
         strike = spot
 
     if time_to_expiry <= 0 or forward <= 0 or strike <= 0:
         return ProbabilityEstimate(
-            probability_above=0.5,
-            probability_below=0.5,
-            implied_vol=0.0,
-            r_squared=params.r_squared,
+            probability_above=0.5, probability_below=0.5,
+            implied_vol=0.0, r_squared=params.r_squared,
         )
 
     k = math.log(strike / forward)
@@ -167,7 +160,6 @@ def extract_probability(
         implied_vol * math.sqrt(time_to_expiry)
     )
     d2 = d1 - implied_vol * math.sqrt(time_to_expiry)
-
     prob_above = norm.cdf(d2)
 
     return ProbabilityEstimate(
@@ -186,17 +178,10 @@ def generate_synthetic_surface(
     skew: float = -0.1,
     noise_std: float = 0.01,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Generate synthetic implied vol surface for testing/calibration.
-    Useful for paper mode when real option data isn't available.
-
-    Returns:
-        (strikes, implied_vols) arrays
-    """
+    """Generate synthetic IV surface for paper mode / testing."""
     rng = np.random.default_rng(42)
     moneyness = np.linspace(-0.3, 0.3, n_strikes)
     strikes = spot * np.exp(moneyness)
-    # Simple smile: vol = base_vol + skew * k + curvature * k^2
     implied_vols = base_vol + skew * moneyness + 0.5 * moneyness**2
     implied_vols += rng.normal(0, noise_std, n_strikes)
     implied_vols = np.maximum(implied_vols, 0.01)

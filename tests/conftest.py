@@ -1,5 +1,3 @@
-"""Shared fixtures for tests."""
-
 import os
 import tempfile
 
@@ -19,6 +17,7 @@ def clob_config():
 
 @pytest.fixture
 def chain_config():
+    # hardhat account #0
     return ChainConfig(
         rpc_url="http://localhost:8545",
         chain_id=137,

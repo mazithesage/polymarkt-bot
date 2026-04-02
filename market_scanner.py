@@ -1,13 +1,4 @@
-"""
-Market scanning and classification module.
-Sourced from: realfishsam/prediction-market-arbitrage-bot (market discovery),
-              demone456/kalshi-polymarket-bot (dual-platform scanning),
-              ThinkEnigmatic/polymarket-bot-arena (market classification),
-              Polymarket/poly-market-maker (Gamma API integration).
-
-Handles: async market discovery via Gamma API, classification of markets
-by category, filtering for tradeable markets, and edge detection.
-"""
+"""Market discovery and classification via the Gamma API."""
 
 import asyncio
 import logging
@@ -33,6 +24,7 @@ class MarketCategory(str, Enum):
     OTHER = "other"
 
 
+# TODO: this keyword matching is embarrassingly naive, replace with proper NLP or at least TF-IDF
 CATEGORY_KEYWORDS = {
     MarketCategory.CRYPTO: [
         "bitcoin", "btc", "ethereum", "eth", "crypto", "token", "solana",
@@ -67,7 +59,7 @@ class Market:
     question: str
     description: str
     category: MarketCategory
-    tokens: List[Dict]  # [{"token_id": ..., "outcome": "Yes"}, ...]
+    tokens: List[Dict]
     end_date: str
     active: bool
     volume: float
@@ -94,7 +86,6 @@ class Market:
 
 
 def classify_market(question: str, description: str = "") -> MarketCategory:
-    """Classify a market by its question text using keyword matching."""
     text = (question + " " + description).lower()
     scores: dict[MarketCategory, int] = {}
     for category, keywords in CATEGORY_KEYWORDS.items():
@@ -107,7 +98,6 @@ def classify_market(question: str, description: str = "") -> MarketCategory:
 
 
 def _parse_market(raw: dict) -> Market:
-    """Parse a raw Gamma API market response into a Market object."""
     tokens = []
     for t in raw.get("tokens", []):
         tokens.append({
@@ -131,7 +121,6 @@ def _parse_market(raw: dict) -> Market:
 
 
 class MarketScanner:
-    """Async scanner that discovers and classifies Polymarket markets."""
 
     def __init__(self, clob_config: ClobConfig):
         self.gamma_url = clob_config.gamma_url
@@ -142,9 +131,7 @@ class MarketScanner:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
             connector = aiohttp.TCPConnector(limit=20, limit_per_host=10)
-            self._session = aiohttp.ClientSession(
-                timeout=timeout, connector=connector,
-            )
+            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return self._session
 
     async def close(self):
@@ -154,7 +141,6 @@ class MarketScanner:
     async def fetch_active_markets(
         self, limit: int = 100, min_liquidity: float = 0.0
     ) -> List[Market]:
-        """Fetch active markets from Gamma API with pagination."""
         session = await self._get_session()
         all_markets: List[Market] = []
         page_size = min(limit, 100)
@@ -178,13 +164,10 @@ class MarketScanner:
             try:
                 async with self._semaphore:
                     resp = await retry_request(
-                        session, "GET", f"{self.gamma_url}/markets",
-                        params=params,
+                        session, "GET", f"{self.gamma_url}/markets", params=params,
                     )
                     if resp.status != 200:
-                        logger.warning(
-                            f"Market fetch returned {resp.status} on page {page}"
-                        )
+                        logger.warning(f"Market fetch returned {resp.status} on page {page}")
                         break
                     data = await resp.json()
             except Exception as e:
@@ -213,11 +196,8 @@ class MarketScanner:
         return all_markets
 
     async def fetch_market_by_condition(self, condition_id: str) -> Optional[Market]:
-        """Fetch a specific market by condition ID."""
         session = await self._get_session()
-        async with session.get(
-            f"{self.gamma_url}/markets/{condition_id}"
-        ) as resp:
+        async with session.get(f"{self.gamma_url}/markets/{condition_id}") as resp:
             if resp.status != 200:
                 return None
             data = await resp.json()
@@ -227,7 +207,6 @@ class MarketScanner:
         self, limit: int = 100, min_liquidity: float = 0.0,
         categories: Optional[List[MarketCategory]] = None,
     ) -> List[Market]:
-        """Scan markets, classify them, and optionally filter by category."""
         markets = await self.fetch_active_markets(limit, min_liquidity)
         if categories:
             markets = [m for m in markets if m.category in categories]

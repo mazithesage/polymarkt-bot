@@ -1,5 +1,3 @@
-"""Tests for shared retry utility."""
-
 import asyncio
 from unittest.mock import patch
 
@@ -8,6 +6,10 @@ import pytest
 from aioresponses import aioresponses
 
 from retry import retry_request
+
+
+async def _async_noop(delay):
+    pass
 
 
 @pytest.mark.asyncio
@@ -67,9 +69,7 @@ class TestRetryRequest:
         with aioresponses() as m:
             m.get("http://test.com/bad", status=400, payload={"error": "bad request"})
             async with aiohttp.ClientSession() as session:
-                resp = await retry_request(
-                    session, "GET", "http://test.com/bad", max_retries=3,
-                )
+                resp = await retry_request(session, "GET", "http://test.com/bad", max_retries=3)
                 assert resp.status == 400
 
     async def test_exhausted_retries_raises(self):
@@ -113,8 +113,7 @@ class TestRetryRequest:
             m.post("http://test.com/submit", payload={"id": "123"})
             async with aiohttp.ClientSession() as session:
                 resp = await retry_request(
-                    session, "POST", "http://test.com/submit",
-                    json={"data": "test"},
+                    session, "POST", "http://test.com/submit", json={"data": "test"},
                 )
                 assert resp.status == 200
 
@@ -134,11 +133,5 @@ class TestRetryRequest:
                         session, "GET", "http://test.com/exp",
                         max_retries=3, base_delay=1.0,
                     )
-            # Exponential: 1.0 * 2^0 = 1.0, 1.0 * 2^1 = 2.0
             assert sleep_calls[0] == pytest.approx(1.0)
             assert sleep_calls[1] == pytest.approx(2.0)
-
-
-async def _async_noop(delay):
-    """No-op async sleep replacement."""
-    pass

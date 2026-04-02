@@ -1,7 +1,4 @@
-"""
-Shared async retry utility with exponential backoff.
-Used by clob_client and market_scanner for resilient HTTP requests.
-"""
+"""Async HTTP retry with exponential backoff."""
 
 import asyncio
 import logging
@@ -11,6 +8,7 @@ import aiohttp
 
 logger = logging.getLogger("polymarket-bot")
 
+# Poly's API has a habit of 502ing under load
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
@@ -23,17 +21,6 @@ async def retry_request(
     base_delay: float = 0.5,
     **kwargs: Any,
 ) -> aiohttp.ClientResponse:
-    """
-    Execute an HTTP request with retry logic.
-
-    Retries on:
-      - HTTP 429/500/502/503/504
-      - aiohttp.ClientError (connection issues)
-      - asyncio.TimeoutError
-
-    Respects Retry-After header on 429 responses.
-    Raises on non-retryable 4xx or exhausted retries.
-    """
     last_exception: Optional[Exception] = None
 
     for attempt in range(max_retries + 1):
@@ -41,7 +28,7 @@ async def retry_request(
             resp = await session.request(method, url, **kwargs)
             if resp.status not in RETRYABLE_STATUS_CODES:
                 return resp
-            # Retryable HTTP status
+
             body = await resp.text()
             last_exception = aiohttp.ClientResponseError(
                 request_info=resp.request_info,
@@ -75,7 +62,6 @@ async def retry_request(
 def _compute_delay(
     resp: aiohttp.ClientResponse, attempt: int, base_delay: float
 ) -> float:
-    """Compute retry delay, respecting Retry-After header."""
     retry_after = resp.headers.get("Retry-After")
     if retry_after is not None:
         try:

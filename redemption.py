@@ -1,12 +1,4 @@
-"""
-On-chain redemption module for settled Polymarket markets.
-Sourced from: Polymarket/py-clob-client (contract ABIs),
-              Polymarket/go-order-utils (redemption patterns),
-              bit-nexusxtitmtdsuy/Polymarket_Bot (web3 integration).
-
-Handles: checking if markets are resolved, redeeming winning
-positions via the CTF Exchange contract on Polygon.
-"""
+"""On-chain redemption of settled Polymarket positions via CTF contracts on Polygon."""
 
 import json
 import logging
@@ -20,7 +12,7 @@ from config import ChainConfig
 
 logger = logging.getLogger(__name__)
 
-# Minimal ABI for ConditionalTokens contract - redeemPositions
+# Minimal ABIs — only the functions we actually call
 CONDITIONAL_TOKENS_ABI = json.loads("""[
     {
         "inputs": [
@@ -35,41 +27,28 @@ CONDITIONAL_TOKENS_ABI = json.loads("""[
         "type": "function"
     },
     {
-        "inputs": [
-            {"name": "conditionId", "type": "bytes32"}
-        ],
+        "inputs": [{"name": "conditionId", "type": "bytes32"}],
         "name": "getConditionId",
-        "outputs": [
-            {"name": "", "type": "bytes32"}
-        ],
+        "outputs": [{"name": "", "type": "bytes32"}],
         "stateMutability": "view",
         "type": "function"
     },
     {
-        "inputs": [
-            {"name": "conditionId", "type": "bytes32"}
-        ],
+        "inputs": [{"name": "conditionId", "type": "bytes32"}],
         "name": "payoutNumerators",
-        "outputs": [
-            {"name": "", "type": "uint256[]"}
-        ],
+        "outputs": [{"name": "", "type": "uint256[]"}],
         "stateMutability": "view",
         "type": "function"
     },
     {
-        "inputs": [
-            {"name": "conditionId", "type": "bytes32"}
-        ],
+        "inputs": [{"name": "conditionId", "type": "bytes32"}],
         "name": "payoutDenominator",
-        "outputs": [
-            {"name": "", "type": "uint256"}
-        ],
+        "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
         "type": "function"
     }
 ]""")
 
-# Minimal ABI for NegRiskExchange
 NEG_RISK_ABI = json.loads("""[
     {
         "inputs": [
@@ -83,6 +62,9 @@ NEG_RISK_ABI = json.loads("""[
     }
 ]""")
 
+# Gas estimation is generous — 300k covers worst-case multicall
+REDEEM_GAS_LIMIT = 300_000
+
 
 @dataclass
 class RedemptionResult:
@@ -94,14 +76,12 @@ class RedemptionResult:
 
 
 def get_web3(chain_config: ChainConfig) -> Web3:
-    """Create a Web3 instance connected to Polygon."""
     w3 = Web3(Web3.HTTPProvider(chain_config.rpc_url))
     w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     return w3
 
 
 def is_condition_resolved(w3: Web3, chain_config: ChainConfig, condition_id: str) -> bool:
-    """Check if a condition has been resolved on-chain."""
     ct = w3.eth.contract(
         address=Web3.to_checksum_address(chain_config.conditional_tokens),
         abi=CONDITIONAL_TOKENS_ABI,
@@ -122,18 +102,8 @@ def redeem_positions(
     index_sets: Optional[List[int]] = None,
     neg_risk: bool = False,
 ) -> RedemptionResult:
-    """
-    Redeem winning positions for a resolved condition.
-
-    Args:
-        w3: Web3 instance
-        chain_config: Chain configuration
-        condition_id: The condition ID (hex string)
-        index_sets: Index sets for redemption (default [1, 2] for binary)
-        neg_risk: Whether this is a neg-risk market
-    """
     if index_sets is None:
-        index_sets = [1, 2]
+        index_sets = [1, 2]  # binary market default
 
     condition_bytes = bytes.fromhex(condition_id.replace("0x", ""))
     account = w3.eth.account.from_key(chain_config.private_key)
@@ -149,7 +119,7 @@ def redeem_positions(
         ).build_transaction({
             "from": Web3.to_checksum_address(sender),
             "nonce": w3.eth.get_transaction_count(Web3.to_checksum_address(sender)),
-            "gas": 300_000,
+            "gas": REDEEM_GAS_LIMIT,
             "gasPrice": w3.eth.gas_price,
         })
     else:
@@ -157,7 +127,7 @@ def redeem_positions(
             address=Web3.to_checksum_address(chain_config.conditional_tokens),
             abi=CONDITIONAL_TOKENS_ABI,
         )
-        parent_collection = b"\x00" * 32
+        parent_collection = b"\x00" * 32  # null bytes32 for root collection
         tx = contract.functions.redeemPositions(
             Web3.to_checksum_address(chain_config.usdc_address),
             parent_collection,
@@ -166,7 +136,7 @@ def redeem_positions(
         ).build_transaction({
             "from": Web3.to_checksum_address(sender),
             "nonce": w3.eth.get_transaction_count(Web3.to_checksum_address(sender)),
-            "gas": 300_000,
+            "gas": REDEEM_GAS_LIMIT,
             "gasPrice": w3.eth.gas_price,
         })
 
@@ -178,13 +148,12 @@ def redeem_positions(
         condition_id=condition_id,
         tx_hash=tx_hash.hex(),
         status="SUCCESS" if receipt["status"] == 1 else "FAILED",
-        amount_redeemed=0.0,  # Would need to decode logs for exact amount
+        amount_redeemed=0.0,  # TODO: decode Transfer logs for exact amount
         gas_used=receipt["gasUsed"],
     )
 
 
 class RedemptionManager:
-    """Manages on-chain redemption of settled positions."""
 
     def __init__(self, chain_config: ChainConfig):
         self.chain_config = chain_config
@@ -199,14 +168,10 @@ class RedemptionManager:
     def check_and_redeem(
         self, condition_id: str, neg_risk: bool = False
     ) -> RedemptionResult:
-        """Check if a condition is resolved and redeem if so."""
         if not is_condition_resolved(self.w3, self.chain_config, condition_id):
             return RedemptionResult(
-                condition_id=condition_id,
-                tx_hash="",
-                status="NOT_RESOLVED",
-                amount_redeemed=0.0,
-                gas_used=0,
+                condition_id=condition_id, tx_hash="",
+                status="NOT_RESOLVED", amount_redeemed=0.0, gas_used=0,
             )
         return redeem_positions(
             self.w3, self.chain_config, condition_id, neg_risk=neg_risk

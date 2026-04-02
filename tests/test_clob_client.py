@@ -1,5 +1,3 @@
-"""Tests for CLOB client module - order construction, signing, auth."""
-
 import time
 
 import pytest
@@ -8,6 +6,7 @@ from clob_client import (
     Order,
     OrderType,
     Side,
+    USDC_BASE_UNITS,
     _price_to_amounts,
     build_order_message,
     create_auth_headers,
@@ -18,13 +17,8 @@ from clob_client import (
 
 class TestOrderConstruction:
     def test_buy_order_to_dict(self):
-        order = Order(
-            token_id="12345",
-            side=Side.BUY,
-            price=0.55,
-            size=10.0,
-            order_type=OrderType.GTC,
-        )
+        order = Order(token_id="12345", side=Side.BUY, price=0.55, size=10.0,
+                      order_type=OrderType.GTC)
         d = order.to_dict()
         assert d["tokenID"] == "12345"
         assert d["side"] == "BUY"
@@ -33,15 +27,8 @@ class TestOrderConstruction:
         assert d["orderType"] == "GTC"
 
     def test_sell_order_to_dict(self):
-        order = Order(
-            token_id="67890",
-            side=Side.SELL,
-            price=0.70,
-            size=5.0,
-            order_type=OrderType.GTC,
-        )
-        d = order.to_dict()
-        assert d["side"] == "SELL"
+        order = Order(token_id="67890", side=Side.SELL, price=0.70, size=5.0)
+        assert order.to_dict()["side"] == "SELL"
 
     def test_order_default_type_is_gtc(self):
         order = Order(token_id="1", side=Side.BUY, price=0.5, size=1.0)
@@ -81,17 +68,17 @@ class TestOrderValidation:
 class TestPriceToAmounts:
     def test_buy_amounts(self):
         maker, taker = _price_to_amounts(0.50, 10.0, Side.BUY)
-        assert maker == 5_000_000  # 0.50 * 10.0 * 1e6
-        assert taker == 10_000_000  # 10.0 * 1e6
+        assert maker == 5_000_000   # 0.50 * 10.0 * USDC_BASE_UNITS
+        assert taker == 10_000_000
 
     def test_sell_amounts(self):
         maker, taker = _price_to_amounts(0.50, 10.0, Side.SELL)
-        assert maker == 10_000_000  # 10.0 * 1e6
-        assert taker == 5_000_000  # 0.50 * 10.0 * 1e6
+        assert maker == 10_000_000
+        assert taker == 5_000_000
 
     def test_extreme_price_low(self):
         maker, taker = _price_to_amounts(0.01, 100.0, Side.BUY)
-        assert maker == 1_000_000  # 0.01 * 100.0 * 1e6
+        assert maker == 1_000_000
         assert taker == 100_000_000
 
     def test_extreme_price_high(self):
@@ -117,12 +104,8 @@ class TestOrderMessage:
 
     def test_build_sell_message(self):
         order = Order(token_id="99999", side=Side.SELL, price=0.70, size=5.0)
-        msg = build_order_message(
-            order,
-            maker="0x" + "aa" * 20,
-            signer="0x" + "bb" * 20,
-        )
-        assert msg["side"] == 1  # SELL
+        msg = build_order_message(order, maker="0x" + "aa" * 20, signer="0x" + "bb" * 20)
+        assert msg["side"] == 1
 
     def test_salt_is_timestamp_based(self):
         order = Order(token_id="1", side=Side.BUY, price=0.5, size=1.0)
@@ -143,7 +126,7 @@ class TestEIP712Signing:
         )
         sig = sign_order(msg, self.PRIVATE_KEY)
         assert isinstance(sig, str)
-        assert len(sig) == 130  # 65 bytes in hex
+        assert len(sig) == 130  # 65 bytes hex
 
     def test_different_orders_different_signatures(self):
         order1 = Order(token_id="111", side=Side.BUY, price=0.50, size=10.0)
@@ -158,9 +141,7 @@ class TestEIP712Signing:
             maker="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
             signer="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
         )
-        sig1 = sign_order(msg1, self.PRIVATE_KEY)
-        sig2 = sign_order(msg2, self.PRIVATE_KEY)
-        assert sig1 != sig2
+        assert sign_order(msg1, self.PRIVATE_KEY) != sign_order(msg2, self.PRIVATE_KEY)
 
 
 class TestHMACAuth:
@@ -170,15 +151,12 @@ class TestHMACAuth:
         assert sig1 == sig2
 
     def test_hmac_different_methods(self):
-        sig_get = create_hmac_signature("secret", "12345", "GET", "/book")
-        sig_post = create_hmac_signature("secret", "12345", "POST", "/book")
-        assert sig_get != sig_post
+        assert (create_hmac_signature("secret", "12345", "GET", "/book")
+                != create_hmac_signature("secret", "12345", "POST", "/book"))
 
     def test_auth_headers_contain_required_keys(self):
         headers = create_auth_headers("key", "secret", "pass", "GET", "/book")
-        assert "POLY_API_KEY" in headers
-        assert "POLY_SIGNATURE" in headers
-        assert "POLY_TIMESTAMP" in headers
-        assert "POLY_PASSPHRASE" in headers
         assert headers["POLY_API_KEY"] == "key"
         assert headers["POLY_PASSPHRASE"] == "pass"
+        assert "POLY_SIGNATURE" in headers
+        assert "POLY_TIMESTAMP" in headers

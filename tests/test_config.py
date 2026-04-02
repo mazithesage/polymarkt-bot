@@ -1,7 +1,4 @@
-"""Tests for config validation and load_config."""
-
 import pytest
-
 from config import BotConfig, ChainConfig, ClobConfig, validate_live_config
 
 
@@ -70,30 +67,27 @@ class TestBotConfigValidation:
         assert cfg.http_timeout == 30.0
         assert cfg.http_max_retries == 3
 
+    def test_circuit_breaker_defaults(self):
+        cfg = BotConfig()
+        assert cfg.max_consecutive_failures == 5
+        assert cfg.circuit_breaker_cooldown == 300
+
 
 class TestValidateLiveConfig:
     def test_paper_mode_always_passes(self):
-        clob = ClobConfig()
-        chain = ChainConfig()
-        bot = BotConfig(paper_mode=True)
-        validate_live_config(clob, chain, bot)  # Should not raise
+        validate_live_config(ClobConfig(), ChainConfig(), BotConfig(paper_mode=True))
 
     def test_live_mode_missing_all_raises(self):
-        clob = ClobConfig()
-        chain = ChainConfig()
-        bot = BotConfig(paper_mode=False)
         with pytest.raises(ValueError, match="PRIVATE_KEY"):
-            validate_live_config(clob, chain, bot)
+            validate_live_config(ClobConfig(), ChainConfig(), BotConfig(paper_mode=False))
 
     def test_live_mode_with_credentials_passes(self):
         clob = ClobConfig(api_key="k", api_secret="s", api_passphrase="p")
         chain = ChainConfig(private_key="0xdeadbeef")
-        bot = BotConfig(paper_mode=False)
-        validate_live_config(clob, chain, bot)  # Should not raise
+        validate_live_config(clob, chain, BotConfig(paper_mode=False))
 
     def test_live_mode_missing_api_key_raises(self):
         clob = ClobConfig(api_secret="s", api_passphrase="p")
         chain = ChainConfig(private_key="0xdeadbeef")
-        bot = BotConfig(paper_mode=False)
         with pytest.raises(ValueError, match="API_KEY"):
-            validate_live_config(clob, chain, bot)
+            validate_live_config(clob, chain, BotConfig(paper_mode=False))

@@ -1,16 +1,19 @@
-"""
-Configuration module for the Polymarket trading bot.
-Loads settings from environment variables with sensible defaults.
-Sourced from patterns in: perpetual-s/polymarket-python-infrastructure, demone456/kalshi-polymarket-bot
-"""
+"""Bot configuration. Loads from env vars with sane defaults."""
 
 import os
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Tuple
+
 from dotenv import load_dotenv
 
-load_dotenv()
+POLYGON_CHAIN_ID = 137
+USDC_DECIMALS = 6
+
+# Polymarket contract addresses (Polygon mainnet)
+CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+NEG_RISK_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 
 
 @dataclass(frozen=True)
@@ -25,13 +28,13 @@ class ClobConfig:
 @dataclass(frozen=True)
 class ChainConfig:
     rpc_url: str = "https://polygon-rpc.com"
-    chain_id: int = 137
+    chain_id: int = POLYGON_CHAIN_ID
     private_key: str = ""
     proxy_address: str = ""
-    ctf_exchange: str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-    neg_risk_exchange: str = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
-    conditional_tokens: str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-    usdc_address: str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    ctf_exchange: str = CTF_EXCHANGE
+    neg_risk_exchange: str = NEG_RISK_EXCHANGE
+    conditional_tokens: str = CONDITIONAL_TOKENS
+    usdc_address: str = USDC_ADDRESS
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,9 @@ class BotConfig:
     slippage_impact_bps: int = 10
     http_timeout: float = 30.0
     http_max_retries: int = 3
+    # Circuit breaker — pause after repeated scan failures
+    max_consecutive_failures: int = 5
+    circuit_breaker_cooldown: int = 300  # seconds
 
     def __post_init__(self):
         if not (0 < self.kelly_fraction <= 1):
@@ -65,7 +71,6 @@ class BotConfig:
 
 
 def validate_live_config(clob: ClobConfig, chain: ChainConfig, bot: BotConfig) -> None:
-    """Validate that live-mode configuration has required credentials."""
     if bot.paper_mode:
         return
     errors = []
@@ -82,6 +87,8 @@ def validate_live_config(clob: ClobConfig, chain: ChainConfig, bot: BotConfig) -
 
 
 def load_config() -> Tuple[ClobConfig, ChainConfig, BotConfig]:
+    load_dotenv()  # side effects belong in explicit callsites, not module scope
+
     clob = ClobConfig(
         api_key=os.getenv("POLYMARKET_API_KEY", ""),
         api_secret=os.getenv("POLYMARKET_API_SECRET", ""),
@@ -89,7 +96,7 @@ def load_config() -> Tuple[ClobConfig, ChainConfig, BotConfig]:
     )
     chain = ChainConfig(
         rpc_url=os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com"),
-        chain_id=int(os.getenv("CHAIN_ID", "137")),
+        chain_id=int(os.getenv("CHAIN_ID", str(POLYGON_CHAIN_ID))),
         private_key=os.getenv("PRIVATE_KEY", ""),
         proxy_address=os.getenv("PROXY_ADDRESS", ""),
     )
@@ -107,5 +114,7 @@ def load_config() -> Tuple[ClobConfig, ChainConfig, BotConfig]:
         slippage_impact_bps=int(os.getenv("SLIPPAGE_IMPACT_BPS", "10")),
         http_timeout=float(os.getenv("HTTP_TIMEOUT", "30.0")),
         http_max_retries=int(os.getenv("HTTP_MAX_RETRIES", "3")),
+        max_consecutive_failures=int(os.getenv("MAX_CONSECUTIVE_FAILURES", "5")),
+        circuit_breaker_cooldown=int(os.getenv("CIRCUIT_BREAKER_COOLDOWN", "300")),
     )
     return clob, chain, bot

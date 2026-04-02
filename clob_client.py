@@ -1,10 +1,5 @@
 """
-CLOB client wrapper for Polymarket order execution.
-Sourced from: Polymarket/py-clob-client (official SDK patterns),
-              hbr-l/polypy (simplified wrapper), Jonmaa/btc-polymarket-bot (order flow).
-
-Handles: API authentication (HMAC), order building, EIP-712 signing,
-         order submission, and order book queries.
+Polymarket CLOB API client — order building, EIP-712 signing, book queries.
 """
 
 import asyncio
@@ -21,10 +16,12 @@ import aiohttp
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
-from config import ClobConfig, ChainConfig
+from config import ClobConfig, ChainConfig, POLYGON_CHAIN_ID, USDC_DECIMALS
 from retry import retry_request
 
 logger = logging.getLogger("polymarket-bot")
+
+USDC_BASE_UNITS = 10 ** USDC_DECIMALS  # 1 USDC = 1_000_000 base units
 
 
 class Side(str, Enum):
@@ -90,11 +87,11 @@ class OrderResult:
     timestamp: float
 
 
-# EIP-712 domain and types for Polymarket Exchange contract
+# EIP-712 domain for Polymarket CTF Exchange on Polygon
 EXCHANGE_DOMAIN = {
     "name": "Polymarket CTF Exchange",
     "version": "1",
-    "chainId": 137,
+    "chainId": POLYGON_CHAIN_ID,
     "verifyingContract": "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
 }
 
@@ -124,13 +121,12 @@ ORDER_TYPES = {
 
 def _price_to_amounts(price: float, size: float, side: Side) -> Tuple[int, int]:
     """Convert price/size to maker/taker amounts in USDC base units (6 decimals)."""
-    usdc_decimals = 10**6
     if side == Side.BUY:
-        maker_amount = int(price * size * usdc_decimals)
-        taker_amount = int(size * usdc_decimals)
+        maker_amount = int(price * size * USDC_BASE_UNITS)
+        taker_amount = int(size * USDC_BASE_UNITS)
     else:
-        maker_amount = int(size * usdc_decimals)
-        taker_amount = int(price * size * usdc_decimals)
+        maker_amount = int(size * USDC_BASE_UNITS)
+        taker_amount = int(price * size * USDC_BASE_UNITS)
     return maker_amount, taker_amount
 
 
@@ -141,7 +137,7 @@ def build_order_message(
     nonce: int = 0,
     fee_rate_bps: int = 0,
 ) -> dict:
-    """Build an EIP-712 typed order message for signing."""
+    """Build EIP-712 typed order message for signing."""
     maker_amount, taker_amount = _price_to_amounts(order.price, order.size, order.side)
     salt = int(time.time() * 1000)
     side_int = 0 if order.side == Side.BUY else 1
@@ -161,8 +157,8 @@ def build_order_message(
     }
 
 
-def sign_order(order_message: dict, private_key: str, chain_id: int = 137) -> str:
-    """Sign an order using EIP-712 typed data."""
+def sign_order(order_message: dict, private_key: str, chain_id: int = POLYGON_CHAIN_ID) -> str:
+    """Sign an order via EIP-712 typed data."""
     domain = {**EXCHANGE_DOMAIN, "chainId": chain_id}
     signable = encode_typed_data(
         full_message={
@@ -180,7 +176,6 @@ def sign_order(order_message: dict, private_key: str, chain_id: int = 137) -> st
 def create_hmac_signature(
     api_secret: str, timestamp: str, method: str, path: str, body: str = ""
 ) -> str:
-    """Create HMAC signature for CLOB API authentication."""
     message = timestamp + method.upper() + path + body
     return hmac.new(
         api_secret.encode(), message.encode(), hashlib.sha256
@@ -189,7 +184,6 @@ def create_hmac_signature(
 
 def create_auth_headers(api_key: str, api_secret: str, api_passphrase: str,
                         method: str, path: str, body: str = "") -> dict:
-    """Build authenticated request headers for CLOB API."""
     timestamp = str(int(time.time()))
     signature = create_hmac_signature(api_secret, timestamp, method, path, body)
     return {
@@ -204,20 +198,20 @@ def create_auth_headers(api_key: str, api_secret: str, api_passphrase: str,
 class ClobClient:
     """Async wrapper around the Polymarket CLOB API."""
 
+    MAX_CONCURRENT = 5  # rate-limit friendly
+
     def __init__(self, clob_config: ClobConfig, chain_config: ChainConfig):
         self.config = clob_config
         self.chain = chain_config
         self.base_url = clob_config.base_url
         self._session: Optional[aiohttp.ClientSession] = None
-        self._semaphore = asyncio.Semaphore(5)
+        self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
             connector = aiohttp.TCPConnector(limit=20, limit_per_host=10)
-            self._session = aiohttp.ClientSession(
-                timeout=timeout, connector=connector,
-            )
+            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return self._session
 
     async def close(self):
@@ -231,20 +225,16 @@ class ClobClient:
         )
 
     async def get_order_book(self, token_id: str) -> OrderBookSummary:
-        """Fetch order book for a token and return a summary."""
         session = await self._get_session()
         path = f"/book?token_id={token_id}"
         headers = self._auth_headers("GET", path)
         async with self._semaphore:
-            resp = await retry_request(
-                session, "GET", f"{self.base_url}{path}", headers=headers,
-            )
+            resp = await retry_request(session, "GET", f"{self.base_url}{path}", headers=headers)
             data = await resp.json()
 
         bids = data.get("bids", []) or []
         asks = data.get("asks", []) or []
 
-        # Defensive price parsing
         def _safe_price(entry: dict) -> Optional[float]:
             try:
                 p = float(entry.get("price", ""))
@@ -258,14 +248,19 @@ class ClobClient:
         best_bid = float(valid_bids[0]["price"]) if valid_bids else 0.0
         best_ask = float(valid_asks[0]["price"]) if valid_asks else 1.0
 
-        # Crossed book detection
+        # Crossed book: bid >= ask means one side is stale.
+        # Conservatively use best_ask as mid and zero-out spread to signal
+        # unreliable book — downstream checks on spread will skip this market.
         if best_bid >= best_ask and valid_bids and valid_asks:
             logger.warning(
-                f"Crossed order book for {token_id}: bid={best_bid} >= ask={best_ask}"
+                "Crossed book for %s: bid=%.4f >= ask=%.4f, treating as unreliable",
+                token_id, best_bid, best_ask,
             )
-            mid = (best_bid + best_ask) / 2
+            mid = best_ask
+            spread = 0.0
         else:
             mid = (best_bid + best_ask) / 2
+            spread = best_ask - best_bid
 
         bid_depth = sum(float(b.get("size", 0)) for b in valid_bids[:5])
         ask_depth = sum(float(a.get("size", 0)) for a in valid_asks[:5])
@@ -274,13 +269,13 @@ class ClobClient:
             best_bid=best_bid,
             best_ask=best_ask,
             mid_price=mid,
-            spread=best_ask - best_bid,
+            spread=spread,
             bid_depth=bid_depth,
             ask_depth=ask_depth,
         )
 
     async def submit_order(self, order: Order) -> OrderResult:
-        """Sign and submit a GTC limit order to the CLOB."""
+        """Sign and submit a limit order."""
         account = Account.from_key(self.chain.private_key)
         maker = self.chain.proxy_address or account.address
         signer = account.address
@@ -324,18 +319,14 @@ class ClobClient:
         )
 
     async def cancel_order(self, order_id: str) -> dict:
-        """Cancel an open order."""
         session = await self._get_session()
         path = f"/order/{order_id}"
         headers = self._auth_headers("DELETE", path)
         async with self._semaphore:
-            resp = await retry_request(
-                session, "DELETE", f"{self.base_url}{path}", headers=headers,
-            )
+            resp = await retry_request(session, "DELETE", f"{self.base_url}{path}", headers=headers)
             return await resp.json()
 
     async def get_open_orders(self) -> List[Dict]:
-        """Get all open orders."""
         session = await self._get_session()
         path = "/orders"
         headers = self._auth_headers("GET", path)
