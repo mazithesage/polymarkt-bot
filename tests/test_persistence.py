@@ -105,13 +105,17 @@ class TestPositionPersistence:
         assert len(positions) == 1
         assert positions[0]["size"] == 10.0
 
-    def test_upsert_updates_existing(self, db_path):
+    def test_upsert_accumulates_with_weighted_avg_price(self, db_path):
         store = PersistenceStore(db_path)
         store.upsert_position("c1", "t1", "YES", 10.0, 0.55, paper_mode=True)
         store.upsert_position("c1", "t1", "YES", 20.0, 0.60, paper_mode=True)
         positions = store.get_open_positions(paper_mode=True)
         assert len(positions) == 1
-        assert positions[0]["size"] == 20.0
+        # Size accumulates: 10 + 20 = 30
+        assert positions[0]["size"] == pytest.approx(30.0)
+        # VWAP: (10 * 0.55 + 20 * 0.60) / 30 = 17.5 / 30 ≈ 0.5833
+        expected_avg = (10.0 * 0.55 + 20.0 * 0.60) / 30.0
+        assert positions[0]["avg_price"] == pytest.approx(expected_avg, abs=0.001)
 
     def test_total_exposure(self, db_path):
         store = PersistenceStore(db_path)
@@ -132,6 +136,38 @@ class TestPositionPersistence:
         store.upsert_position("c1", "t1", "YES", 10.0, 0.50, current_price=0.70)
         positions = store.get_open_positions(paper_mode=False)
         assert positions[0]["pnl"] == pytest.approx(2.0)  # (0.70-0.50)*10
+
+
+class TestVWAPPositionAccumulation:
+    """Verify the weighted average cost basis logic in position upserts."""
+
+    def test_three_fills_accumulate_correctly(self, db_path):
+        store = PersistenceStore(db_path)
+        store.upsert_position("c1", "t1", "YES", 10.0, 0.50, paper_mode=True)
+        store.upsert_position("c1", "t1", "YES", 10.0, 0.60, paper_mode=True)
+        store.upsert_position("c1", "t1", "YES", 10.0, 0.70, paper_mode=True)
+        pos = store.get_open_positions(paper_mode=True)
+        assert len(pos) == 1
+        assert pos[0]["size"] == pytest.approx(30.0)
+        # VWAP: (10*0.50 + 10*0.60 + 10*0.70) / 30 = 18/30 = 0.60
+        assert pos[0]["avg_price"] == pytest.approx(0.60, abs=0.001)
+
+    def test_pnl_uses_accumulated_avg_price(self, db_path):
+        store = PersistenceStore(db_path)
+        store.upsert_position("c1", "t1", "YES", 10.0, 0.40, paper_mode=False)
+        store.upsert_position("c1", "t1", "YES", 10.0, 0.60, current_price=0.70, paper_mode=False)
+        pos = store.get_open_positions(paper_mode=False)
+        # size = 20, avg = (10*0.40 + 10*0.60) / 20 = 0.50
+        # pnl = (0.70 - 0.50) * 20 = 4.0
+        assert pos[0]["avg_price"] == pytest.approx(0.50, abs=0.001)
+        assert pos[0]["pnl"] == pytest.approx(4.0, abs=0.01)
+
+    def test_different_conditions_stay_separate(self, db_path):
+        store = PersistenceStore(db_path)
+        store.upsert_position("c1", "t1", "YES", 10.0, 0.50, paper_mode=True)
+        store.upsert_position("c2", "t2", "NO", 20.0, 0.40, paper_mode=True)
+        positions = store.get_open_positions(paper_mode=True)
+        assert len(positions) == 2
 
 
 class TestScanLog:

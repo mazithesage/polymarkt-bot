@@ -5,6 +5,7 @@ Main bot — async scan loop, SSVI probability estimation, Kelly sizing, paper/l
 import argparse
 import asyncio
 import dataclasses
+import json as _json
 import logging
 import signal
 import sys
@@ -14,7 +15,7 @@ from typing import Optional
 
 import numpy as np
 
-from clob_client import ClobClient, Order, OrderResult, Side, OrderType
+from clob_client import ClobClient, Order, OrderBookSummary, OrderResult, Side, OrderType
 from config import BotConfig, ChainConfig, ClobConfig, load_config, validate_live_config
 from kelly import KellyResult, check_position_limits, kelly_criterion
 from market_scanner import Market, MarketCategory, MarketScanner
@@ -28,19 +29,75 @@ from ssvi import (
 
 logger = logging.getLogger("polymarket-bot")
 
-# Thresholds for market filtering
-MIN_TRADEABLE_PRICE = 0.01
-MAX_TRADEABLE_PRICE = 0.99
-MAX_SPREAD = 0.10
-BANKROLL_MULTIPLIER = 10  # bankroll = 10x max position is a rough heuristic, not portfolio theory
+
+class _JSONFormatter(logging.Formatter):
+    """Structured JSON log formatter for production ingestion."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "ts": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info and record.exc_info[0] is not None:
+            entry["exception"] = self.formatException(record.exc_info)
+        # Propagate any extra structured fields attached to the record
+        for key in ("event", "order_id", "condition_id", "side", "price",
+                     "size", "edge", "slippage", "market"):
+            val = getattr(record, key, None)
+            if val is not None:
+                entry[key] = val
+        return _json.dumps(entry, default=str)
 
 
-def setup_logging(level: str = "INFO") -> None:
+def setup_logging(level: str = "INFO", fmt: str = "text") -> None:
+    handler = logging.StreamHandler(sys.stdout)
+    if fmt == "json":
+        handler.setFormatter(_JSONFormatter())
+    else:
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        ))
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        handlers=[handler],
     )
+
+
+def _estimate_live_fill_price(
+    nominal_price: float,
+    size: float,
+    book: OrderBookSummary,
+    side: str,
+    max_slippage_bps: int,
+) -> Optional[float]:
+    """Estimate expected fill price from order book depth.
+
+    Uses a linear market impact model: if the order size exceeds the
+    available depth on the relevant side, expected slippage increases
+    proportionally. Returns None if estimated slippage exceeds the
+    configured maximum, signaling the order should be skipped.
+    """
+    if side == "BUY":
+        depth = book.ask_depth
+        if depth <= 0:
+            return None
+        # Linear impact: fraction of depth consumed × half spread
+        impact = (size / depth) * (book.spread / 2) if depth > 0 else 0
+        estimated = nominal_price + impact
+    else:
+        depth = book.bid_depth
+        if depth <= 0:
+            return None
+        impact = (size / depth) * (book.spread / 2) if depth > 0 else 0
+        estimated = nominal_price - impact
+
+    # Check if estimated slippage exceeds our tolerance
+    slippage_bps = abs(estimated - nominal_price) / max(nominal_price, 1e-9) * 10_000
+    if slippage_bps > max_slippage_bps:
+        return None
+    return estimated
 
 
 class PolymarketBot:
@@ -116,7 +173,7 @@ class PolymarketBot:
             logger.info(f"Found {len(markets)} active markets")
 
             current_exposure = self.store.get_total_exposure(self.config.paper_mode)
-            bankroll = self.config.max_position_usdc * BANKROLL_MULTIPLIER
+            bankroll = self.config.max_position_usdc * self.config.bankroll_multiplier
 
             for market in markets[: self.config.max_markets]:
                 try:
@@ -168,9 +225,9 @@ class PolymarketBot:
         book = await self.clob.get_order_book(market.yes_token_id)
         market_price = book.mid_price
 
-        if market_price <= MIN_TRADEABLE_PRICE or market_price >= MAX_TRADEABLE_PRICE:
+        if market_price <= self.config.min_tradeable_price or market_price >= self.config.max_tradeable_price:
             return None
-        if book.spread > MAX_SPREAD:
+        if book.spread > self.config.max_spread:
             return None
 
         estimated_prob = await self._estimate_probability(market, book.mid_price)
@@ -283,9 +340,9 @@ class PolymarketBot:
             spread_cost = self.config.slippage_spread_bps / 10_000
             impact = self.config.slippage_impact_bps / 10_000 * size
             if kelly_result.side == "BUY":
-                fill_price = min(price + spread_cost + impact, 0.99)
+                fill_price = min(price + spread_cost + impact, self.config.max_tradeable_price)
             else:
-                fill_price = max(price - spread_cost - impact, 0.01)
+                fill_price = max(price - spread_cost - impact, self.config.min_tradeable_price)
 
             order_id = f"paper-{uuid.uuid4().hex[:12]}"
             result = OrderResult(
@@ -299,6 +356,17 @@ class PolymarketBot:
                 f"on {market.question[:40]}"
             )
         else:
+            # Estimate live slippage from order book depth
+            estimated_fill = _estimate_live_fill_price(
+                price, size, book, kelly_result.side,
+                self.config.slippage_spread_bps,
+            )
+            if estimated_fill is None:
+                logger.warning(
+                    "Skipping live order: estimated slippage too high "
+                    f"(depth too thin for size={size})"
+                )
+                return None
             order = Order(
                 token_id=token_id,
                 side=Side.BUY if kelly_result.side == "BUY" else Side.SELL,
@@ -308,7 +376,8 @@ class PolymarketBot:
             result = await self.clob.submit_order(order)
             logger.info(
                 f"[LIVE] Order {result.order_id}: {result.status} "
-                f"{kelly_result.side} {size} @ {price}"
+                f"{kelly_result.side} {size} @ {price} "
+                f"(est. fill={estimated_fill:.4f})"
             )
 
         self.store.log_order(
@@ -362,7 +431,7 @@ async def main():
     if overrides:
         bot_config = dataclasses.replace(bot_config, **overrides)
 
-    setup_logging(bot_config.log_level)
+    setup_logging(bot_config.log_level, bot_config.log_format)
     validate_live_config(clob_config, chain_config, bot_config)
 
     bot = PolymarketBot(clob_config, chain_config, bot_config)

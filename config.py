@@ -48,6 +48,7 @@ class BotConfig:
     order_type: str = "GTC"
     db_path: str = "data/bot.db"
     log_level: str = "INFO"
+    log_format: str = "text"  # "text" or "json"
     ssvi_r2_threshold: float = 0.70
     slippage_spread_bps: int = 50
     slippage_impact_bps: int = 10
@@ -56,6 +57,11 @@ class BotConfig:
     # Circuit breaker — pause after repeated scan failures
     max_consecutive_failures: int = 5
     circuit_breaker_cooldown: int = 300  # seconds
+    # Market filtering thresholds — previously hardcoded, now tunable
+    min_tradeable_price: float = 0.01
+    max_tradeable_price: float = 0.99
+    max_spread: float = 0.10
+    bankroll_multiplier: float = 10.0
 
     def __post_init__(self):
         if not (0 < self.kelly_fraction <= 1):
@@ -68,6 +74,17 @@ class BotConfig:
             raise ValueError(f"min_edge must be in (0, 1), got {self.min_edge}")
         if self.max_markets <= 0:
             raise ValueError(f"max_markets must be > 0, got {self.max_markets}")
+        if not (0 < self.min_tradeable_price < self.max_tradeable_price < 1):
+            raise ValueError(
+                f"Need 0 < min_tradeable_price < max_tradeable_price < 1, "
+                f"got [{self.min_tradeable_price}, {self.max_tradeable_price}]"
+            )
+        if self.max_spread <= 0 or self.max_spread >= 1:
+            raise ValueError(f"max_spread must be in (0, 1), got {self.max_spread}")
+        if self.bankroll_multiplier <= 0:
+            raise ValueError(f"bankroll_multiplier must be > 0, got {self.bankroll_multiplier}")
+        if self.log_format not in ("text", "json"):
+            raise ValueError(f"log_format must be 'text' or 'json', got {self.log_format}")
 
 
 def validate_live_config(clob: ClobConfig, chain: ChainConfig, bot: BotConfig) -> None:
@@ -109,6 +126,7 @@ def load_config() -> Tuple[ClobConfig, ChainConfig, BotConfig]:
         max_markets=int(os.getenv("MAX_MARKETS", "10")),
         db_path=os.getenv("DB_PATH", "data/bot.db"),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
+        log_format=os.getenv("LOG_FORMAT", "text"),
         ssvi_r2_threshold=float(os.getenv("SSVI_R2_THRESHOLD", "0.70")),
         slippage_spread_bps=int(os.getenv("SLIPPAGE_SPREAD_BPS", "50")),
         slippage_impact_bps=int(os.getenv("SLIPPAGE_IMPACT_BPS", "10")),
@@ -116,5 +134,9 @@ def load_config() -> Tuple[ClobConfig, ChainConfig, BotConfig]:
         http_max_retries=int(os.getenv("HTTP_MAX_RETRIES", "3")),
         max_consecutive_failures=int(os.getenv("MAX_CONSECUTIVE_FAILURES", "5")),
         circuit_breaker_cooldown=int(os.getenv("CIRCUIT_BREAKER_COOLDOWN", "300")),
+        min_tradeable_price=float(os.getenv("MIN_TRADEABLE_PRICE", "0.01")),
+        max_tradeable_price=float(os.getenv("MAX_TRADEABLE_PRICE", "0.99")),
+        max_spread=float(os.getenv("MAX_SPREAD", "0.10")),
+        bankroll_multiplier=float(os.getenv("BANKROLL_MULTIPLIER", "10.0")),
     )
     return clob, chain, bot

@@ -8,9 +8,12 @@ from typing import List, Optional
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
-from config import ChainConfig
+from config import ChainConfig, USDC_DECIMALS
 
 logger = logging.getLogger(__name__)
+
+# ERC-20 Transfer(address,address,uint256) event signature
+_TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)").hex()
 
 # Minimal ABIs — only the functions we actually call
 CONDITIONAL_TOKENS_ABI = json.loads("""[
@@ -144,13 +147,49 @@ def redeem_positions(
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
 
+    amount = _decode_usdc_transfer(
+        receipt, chain_config.usdc_address, sender
+    )
+
     return RedemptionResult(
         condition_id=condition_id,
         tx_hash=tx_hash.hex(),
         status="SUCCESS" if receipt["status"] == 1 else "FAILED",
-        amount_redeemed=0.0,  # TODO: decode Transfer logs for exact amount
+        amount_redeemed=amount,
         gas_used=receipt["gasUsed"],
     )
+
+
+def _decode_usdc_transfer(receipt: dict, usdc_address: str, recipient: str) -> float:
+    """Extract total USDC transferred to recipient from transaction receipt logs.
+
+    Scans for ERC-20 Transfer events emitted by the USDC contract where
+    topic2 (recipient) matches our address. Returns the sum in USDC
+    (human-readable, not base units).
+    """
+    usdc_addr = usdc_address.lower()
+    recipient_padded = "0x" + recipient.lower().replace("0x", "").zfill(64)
+    total_base_units = 0
+
+    for log_entry in receipt.get("logs", []):
+        log_address = log_entry.get("address", "").lower()
+        topics = [t.hex() if isinstance(t, bytes) else t for t in log_entry.get("topics", [])]
+        if len(topics) < 3:
+            continue
+        if log_address != usdc_addr:
+            continue
+        if topics[0] != _TRANSFER_TOPIC:
+            continue
+        if topics[2].lower() != recipient_padded:
+            continue
+        raw_data = log_entry.get("data", "0x")
+        if isinstance(raw_data, bytes):
+            raw_data = raw_data.hex()
+        raw_data = raw_data.replace("0x", "")
+        if raw_data:
+            total_base_units += int(raw_data, 16)
+
+    return total_base_units / (10 ** USDC_DECIMALS)
 
 
 class RedemptionManager:

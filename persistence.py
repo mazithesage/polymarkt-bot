@@ -211,7 +211,6 @@ class PersistenceStore:
         paper_mode: bool = False,
     ) -> None:
         now = time.time()
-        pnl = (current_price - avg_price) * size if current_price > 0 else 0.0
         with _connect(self.db_path) as conn:
             conn.execute(
                 """INSERT INTO positions
@@ -220,13 +219,33 @@ class PersistenceStore:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(condition_id, token_id, paper_mode)
                    DO UPDATE SET
-                     size=excluded.size,
-                     avg_price=excluded.avg_price,
-                     current_price=excluded.current_price,
-                     pnl=excluded.pnl,
-                     updated_at=excluded.updated_at""",
+                     size = positions.size + excluded.size,
+                     avg_price = CASE
+                       WHEN (positions.size + excluded.size) > 0
+                       THEN (positions.size * positions.avg_price
+                             + excluded.size * excluded.avg_price)
+                            / (positions.size + excluded.size)
+                       ELSE excluded.avg_price
+                     END,
+                     current_price = excluded.current_price,
+                     pnl = CASE
+                       WHEN excluded.current_price > 0
+                       THEN (excluded.current_price
+                             - CASE
+                                 WHEN (positions.size + excluded.size) > 0
+                                 THEN (positions.size * positions.avg_price
+                                       + excluded.size * excluded.avg_price)
+                                      / (positions.size + excluded.size)
+                                 ELSE excluded.avg_price
+                               END)
+                            * (positions.size + excluded.size)
+                       ELSE 0.0
+                     END,
+                     updated_at = excluded.updated_at""",
                 (condition_id, token_id, token_choice, size, avg_price,
-                 current_price, pnl, int(paper_mode), now, now),
+                 current_price,
+                 (current_price - avg_price) * size if current_price > 0 else 0.0,
+                 int(paper_mode), now, now),
             )
 
     def get_open_positions(self, paper_mode: bool = False) -> List[Dict]:

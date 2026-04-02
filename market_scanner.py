@@ -2,6 +2,9 @@
 
 import asyncio
 import logging
+import math
+import re
+from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -24,8 +27,9 @@ class MarketCategory(str, Enum):
     OTHER = "other"
 
 
-# TODO: this keyword matching is embarrassingly naive, replace with proper NLP or at least TF-IDF
-CATEGORY_KEYWORDS = {
+# Keyword corpus per category — multi-word phrases are matched as substrings,
+# single words are matched as tokens.
+CATEGORY_KEYWORDS: Dict[MarketCategory, List[str]] = {
     MarketCategory.CRYPTO: [
         "bitcoin", "btc", "ethereum", "eth", "crypto", "token", "solana",
         "blockchain", "defi", "nft",
@@ -51,6 +55,27 @@ CATEGORY_KEYWORDS = {
         "stock", "s&p", "dow", "nasdaq", "treasury",
     ],
 }
+
+
+def _build_idf_weights() -> Dict[str, float]:
+    """Precompute IDF weights from the keyword corpus.
+
+    IDF(term) = log(N / df) where N = number of categories and
+    df = number of categories containing that term.
+    Terms unique to one category get the highest weight.
+    """
+    n_categories = len(CATEGORY_KEYWORDS)
+    doc_freq: Dict[str, int] = defaultdict(int)
+    for keywords in CATEGORY_KEYWORDS.values():
+        seen = set()
+        for kw in keywords:
+            if kw not in seen:
+                doc_freq[kw] += 1
+                seen.add(kw)
+    return {term: math.log(n_categories / df) for term, df in doc_freq.items()}
+
+
+_IDF_WEIGHTS = _build_idf_weights()
 
 
 @dataclass
@@ -85,11 +110,33 @@ class Market:
         return self.tokens[1]["token_id"] if len(self.tokens) > 1 else ""
 
 
+_TOKEN_RE = re.compile(r"[a-z0-9&]+(?:'[a-z]+)?")
+
+
 def classify_market(question: str, description: str = "") -> MarketCategory:
+    """Classify market text using TF-IDF weighted keyword scoring.
+
+    Each keyword hit is weighted by its IDF — keywords unique to a single
+    category are strong discriminators, while keywords appearing across many
+    categories contribute less signal.  Single-word keywords use prefix
+    matching against properly tokenized text (handles plurals, possessives).
+    Multi-word phrases use substring matching.
+    """
     text = (question + " " + description).lower()
-    scores: dict[MarketCategory, int] = {}
+    text_tokens = _TOKEN_RE.findall(text)
+
+    scores: dict[MarketCategory, float] = {}
     for category, keywords in CATEGORY_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in text)
+        score = 0.0
+        for kw in keywords:
+            if " " in kw:
+                # Multi-word phrase: substring match
+                if kw in text:
+                    score += _IDF_WEIGHTS.get(kw, 1.0)
+            else:
+                # Single word: prefix match handles plurals (democrat→democrats)
+                if any(tok.startswith(kw) for tok in text_tokens):
+                    score += _IDF_WEIGHTS.get(kw, 1.0)
         if score > 0:
             scores[category] = score
     if not scores:

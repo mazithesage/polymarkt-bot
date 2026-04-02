@@ -5,6 +5,8 @@ the modules wire together without blowing up.
 """
 
 import asyncio
+import json
+import logging
 import time
 from unittest.mock import AsyncMock, patch
 
@@ -12,7 +14,7 @@ import numpy as np
 import pytest
 import pytest_asyncio
 
-from bot import PolymarketBot, setup_logging
+from bot import PolymarketBot, _estimate_live_fill_price, setup_logging
 from clob_client import ClobClient, Order, OrderBookSummary, Side, OrderType
 from config import BotConfig, ChainConfig, ClobConfig
 from kelly import KellyResult, kelly_criterion
@@ -343,3 +345,155 @@ class TestPaperSlippage:
             await paper_bot.close()
         assert result is not None
         assert result.price <= 0.99
+
+
+class TestLiveSlippageEstimation:
+    """Verify the order book depth-based slippage model for live mode."""
+
+    def _make_book(self, **overrides):
+        defaults = dict(
+            token_id="t1", best_bid=0.50, best_ask=0.55,
+            mid_price=0.525, spread=0.05, bid_depth=100, ask_depth=100,
+        )
+        defaults.update(overrides)
+        return OrderBookSummary(**defaults)
+
+    def test_buy_slippage_increases_price(self):
+        book = self._make_book()
+        est = _estimate_live_fill_price(0.55, 10.0, book, "BUY", 500)
+        assert est is not None
+        assert est > 0.55
+
+    def test_sell_slippage_decreases_price(self):
+        book = self._make_book()
+        est = _estimate_live_fill_price(0.50, 10.0, book, "SELL", 500)
+        assert est is not None
+        assert est < 0.50
+
+    def test_zero_depth_returns_none(self):
+        book = self._make_book(ask_depth=0)
+        assert _estimate_live_fill_price(0.55, 10.0, book, "BUY", 500) is None
+
+    def test_exceeds_max_slippage_returns_none(self):
+        # Large order relative to depth → high slippage → should be rejected
+        book = self._make_book(ask_depth=5, spread=0.10)
+        est = _estimate_live_fill_price(0.55, 100.0, book, "BUY", 10)
+        assert est is None
+
+    def test_small_order_on_deep_book(self):
+        book = self._make_book(ask_depth=10000, spread=0.02)
+        est = _estimate_live_fill_price(0.55, 1.0, book, "BUY", 500)
+        assert est is not None
+        # Slippage should be negligible
+        assert abs(est - 0.55) < 0.001
+
+
+class TestStructuredJSONLogging:
+    """Verify the JSON log formatter produces parseable structured output."""
+
+    def test_json_formatter_produces_valid_json(self):
+        from bot import _JSONFormatter
+        formatter = _JSONFormatter()
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0,
+            msg="Test message %s", args=("arg",), exc_info=None,
+        )
+        output = formatter.format(record)
+        parsed = json.loads(output)
+        assert parsed["msg"] == "Test message arg"
+        assert parsed["level"] == "INFO"
+        assert parsed["logger"] == "test"
+        assert "ts" in parsed
+
+    def test_json_formatter_includes_extra_fields(self):
+        from bot import _JSONFormatter
+        formatter = _JSONFormatter()
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0,
+            msg="Order placed", args=(), exc_info=None,
+        )
+        record.order_id = "test-123"
+        record.side = "BUY"
+        output = formatter.format(record)
+        parsed = json.loads(output)
+        assert parsed["order_id"] == "test-123"
+        assert parsed["side"] == "BUY"
+
+    def test_json_formatter_handles_exception(self):
+        from bot import _JSONFormatter
+        formatter = _JSONFormatter()
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            import sys
+            exc_info = sys.exc_info()
+        record = logging.LogRecord(
+            name="test", level=logging.ERROR, pathname="", lineno=0,
+            msg="Error occurred", args=(), exc_info=exc_info,
+        )
+        output = formatter.format(record)
+        parsed = json.loads(output)
+        assert "exception" in parsed
+        assert "boom" in parsed["exception"]
+
+
+class TestTransferLogDecoding:
+    """Verify USDC Transfer event decoding from transaction receipts."""
+
+    def test_decode_single_transfer(self):
+        from redemption import _decode_usdc_transfer, _TRANSFER_TOPIC
+        recipient = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+        usdc = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        recipient_padded = "0x" + recipient.lower().replace("0x", "").zfill(64)
+        sender_padded = "0x" + ("ab" * 20).zfill(64)
+
+        receipt = {
+            "logs": [{
+                "address": usdc,
+                "topics": [
+                    _TRANSFER_TOPIC,
+                    sender_padded,
+                    recipient_padded,
+                ],
+                "data": "0x" + hex(5_000_000)[2:].zfill(64),  # 5 USDC
+            }]
+        }
+        amount = _decode_usdc_transfer(receipt, usdc, recipient)
+        assert amount == pytest.approx(5.0)
+
+    def test_decode_ignores_non_usdc_transfers(self):
+        from redemption import _decode_usdc_transfer, _TRANSFER_TOPIC
+        recipient = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+        usdc = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        other_token = "0x0000000000000000000000000000000000000001"
+        recipient_padded = "0x" + recipient.lower().replace("0x", "").zfill(64)
+
+        receipt = {
+            "logs": [{
+                "address": other_token,
+                "topics": [_TRANSFER_TOPIC, "0x" + "00" * 32, recipient_padded],
+                "data": "0x" + hex(1_000_000)[2:].zfill(64),
+            }]
+        }
+        assert _decode_usdc_transfer(receipt, usdc, recipient) == 0.0
+
+    def test_decode_empty_logs(self):
+        from redemption import _decode_usdc_transfer
+        assert _decode_usdc_transfer({"logs": []}, "0xabc", "0xdef") == 0.0
+
+    def test_decode_sums_multiple_transfers(self):
+        from redemption import _decode_usdc_transfer, _TRANSFER_TOPIC
+        recipient = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+        usdc = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        recipient_padded = "0x" + recipient.lower().replace("0x", "").zfill(64)
+        sender_padded = "0x" + ("ab" * 20).zfill(64)
+
+        def make_log(amount_base_units):
+            return {
+                "address": usdc,
+                "topics": [_TRANSFER_TOPIC, sender_padded, recipient_padded],
+                "data": "0x" + hex(amount_base_units)[2:].zfill(64),
+            }
+
+        receipt = {"logs": [make_log(3_000_000), make_log(2_000_000)]}
+        assert _decode_usdc_transfer(receipt, usdc, recipient) == pytest.approx(5.0)
