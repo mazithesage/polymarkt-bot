@@ -10,7 +10,6 @@ import logging
 import time
 from unittest.mock import AsyncMock, patch
 
-import numpy as np
 import pytest
 import pytest_asyncio
 
@@ -68,7 +67,9 @@ class TestFullPipelineIntegration:
             max_markets=3, kelly_fraction=0.25, min_edge=0.02,
         )
         setup_logging("DEBUG")
-        return PolymarketBot(clob, chain, bot_cfg)
+        bot = PolymarketBot(clob, chain, bot_cfg)
+        yield bot
+        bot.store.release_lock()
 
     @pytest.mark.asyncio
     async def test_scan_once_paper_mode_no_exceptions(self, paper_bot):
@@ -111,7 +112,9 @@ class TestCircuitBreaker:
             max_consecutive_failures=3,
             circuit_breaker_cooldown=2,  # short for testing
         )
-        return PolymarketBot(clob, chain, bot_cfg)
+        bot = PolymarketBot(clob, chain, bot_cfg)
+        yield bot
+        bot.store.release_lock()
 
     @pytest.mark.asyncio
     async def test_circuit_breaker_trips_after_consecutive_failures(self, paper_bot):
@@ -236,7 +239,9 @@ class TestSSVIR2Rejection:
             ssvi_r2_threshold=0.70,
         )
         setup_logging("DEBUG")
-        return PolymarketBot(clob, chain, bot_cfg)
+        bot = PolymarketBot(clob, chain, bot_cfg)
+        yield bot
+        bot.store.release_lock()
 
     @pytest.mark.asyncio
     async def test_non_crypto_uses_ob_imbalance(self, paper_bot):
@@ -288,7 +293,9 @@ class TestOrderBookImbalanceProbability:
             db_path=str(tmp_path / "ob_test.db"),
             ob_imbalance_weight=0.05,
         )
-        return PolymarketBot(clob, chain, bot_cfg)
+        bot = PolymarketBot(clob, chain, bot_cfg)
+        yield bot
+        bot.store.release_lock()
 
     def test_balanced_book_returns_mid(self, paper_bot):
         book = OrderBookSummary(
@@ -354,8 +361,8 @@ class TestOrderBookImbalanceProbability:
         assert prob == 0.01
 
     @pytest.mark.asyncio
-    async def test_crypto_ssvi_failure_falls_back_to_ob_imbalance(self, paper_bot):
-        """When SSVI fails for crypto multi-token market, fall back to OB imbalance."""
+    async def test_crypto_multi_token_uses_ob_imbalance(self, paper_bot):
+        """Multi-token crypto market should use OB imbalance (SSVI removed)."""
         market = Market(
             condition_id="c1", question="BTC above $100k?", description="",
             category=MarketCategory.CRYPTO,
@@ -366,15 +373,13 @@ class TestOrderBookImbalanceProbability:
             ],
             end_date="", active=True, volume=5000, liquidity=2000, neg_risk=False,
         )
-        # SSVI will fail → should fall back to OB imbalance
         book = OrderBookSummary(
             token_id="t1", best_bid=0.50, best_ask=0.60,
             mid_price=0.55, spread=0.10, bid_depth=300, ask_depth=100,
         )
-        with patch.object(paper_bot, "_ssvi_probability", side_effect=ValueError("low R²")):
-            prob = await paper_bot._estimate_probability(market, book)
+        prob = await paper_bot._estimate_probability(market, book)
         await paper_bot.close()
-        # Should use OB imbalance, not mid_price
+        # OB imbalance: bid_depth > ask_depth → prob > mid_price
         assert prob > 0.55
 
 
@@ -396,7 +401,9 @@ class TestOrderBookImbalanceEndToEnd:
             ob_imbalance_weight=0.05,
         )
         setup_logging("DEBUG")
-        return PolymarketBot(clob, chain, bot_cfg)
+        bot = PolymarketBot(clob, chain, bot_cfg)
+        yield bot
+        bot.store.release_lock()
 
     @pytest.mark.asyncio
     async def test_imbalanced_book_produces_orders(self, paper_bot):
@@ -438,7 +445,9 @@ class TestPaperSlippage:
             slippage_spread_bps=50,
             slippage_impact_bps=10,
         )
-        return PolymarketBot(clob, chain, bot_cfg)
+        bot = PolymarketBot(clob, chain, bot_cfg)
+        yield bot
+        bot.store.release_lock()
 
     def _make_market(self):
         return Market(
@@ -462,9 +471,8 @@ class TestPaperSlippage:
             token_id="t1", best_bid=0.50, best_ask=0.55,
             mid_price=0.525, spread=0.05, bid_depth=100, ask_depth=100,
         )
-        with patch.object(paper_bot.clob, "get_order_book", return_value=book):
-            result = await paper_bot._execute_trade(market, kelly)
-            await paper_bot.close()
+        result = await paper_bot._execute_trade(market, kelly, book)
+        await paper_bot.close()
         assert result is not None
         nominal_price = round(min(book.best_ask, book.mid_price + 0.005), 2)
         assert result.price > nominal_price
@@ -480,9 +488,8 @@ class TestPaperSlippage:
             token_id="t1", best_bid=0.50, best_ask=0.55,
             mid_price=0.525, spread=0.05, bid_depth=100, ask_depth=100,
         )
-        with patch.object(paper_bot.clob, "get_order_book", return_value=book):
-            result = await paper_bot._execute_trade(market, kelly)
-            await paper_bot.close()
+        result = await paper_bot._execute_trade(market, kelly, book)
+        await paper_bot.close()
         assert result is not None
         nominal_price = round(max(book.best_bid, book.mid_price - 0.005), 2)
         assert result.price < nominal_price
@@ -498,9 +505,8 @@ class TestPaperSlippage:
             token_id="t1", best_bid=0.97, best_ask=0.98,
             mid_price=0.975, spread=0.01, bid_depth=100, ask_depth=100,
         )
-        with patch.object(paper_bot.clob, "get_order_book", return_value=book):
-            result = await paper_bot._execute_trade(market, kelly)
-            await paper_bot.close()
+        result = await paper_bot._execute_trade(market, kelly, book)
+        await paper_bot.close()
         assert result is not None
         assert result.price <= 0.99
 

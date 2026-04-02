@@ -1,0 +1,4 @@
+# file: /Users/mac/Documents/GitHub/polymarkt-bot/ssvi.py
+# hypothesis_version: 6.141.1
+
+[-0.8, -0.3, -0.1, 0.0, 1e-10, 1e-08, 1e-06, 0.0001, 0.01, 0.1, 0.3, 0.5, 0.8, 0.99, 1.0, 1.5, 2.0, 5.0, 10.0, 10000000000.0, 365, 500, 2000, 'L-BFGS-B', 'Nelder-Mead', 'maxiter']

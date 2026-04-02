@@ -1,0 +1,4 @@
+# file: /Users/mac/Documents/GitHub/polymarkt-bot/redemption.py
+# hypothesis_version: 6.141.1
+
+[b'\x00', 0.0, 120, 500, 300000, '0x', 'FAILED', 'NOT_RESOLVED', 'SUCCESS', 'address', 'baseFeePerGas', 'data', 'from', 'gas', 'gasUsed', 'gwei', 'latest', 'logs', 'maxFeePerGas', 'maxPriorityFeePerGas', 'nonce', 'polymarket-bot', 'status', 'topics']

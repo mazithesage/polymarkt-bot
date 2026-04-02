@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polymarket Bot Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --text-dim: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5;
+  }
+  .container { max-width: 1400px; margin: 0 auto; padding: 16px; }
+
+  /* Header */
+  .header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 20px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; margin-bottom: 16px;
+  }
+  .header h1 { font-size: 18px; font-weight: 600; }
+  .header .status { display: flex; gap: 16px; align-items: center; font-size: 13px; color: var(--text-dim); }
+  .badge {
+    padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; text-transform: uppercase;
+  }
+  .badge-paper { background: var(--yellow); color: #000; }
+  .badge-live { background: var(--red); color: #fff; }
+  .pulse { width: 8px; height: 8px; background: var(--green); border-radius: 50%; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+  /* Cards row */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px; text-align: center;
+  }
+  .card .label { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+  .card .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+  .card .sub { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+  .pnl-pos { color: var(--green); }
+  .pnl-neg { color: var(--red); }
+
+  /* Chart row */
+  .chart-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  .chart-box {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px; min-height: 300px;
+  }
+  .chart-box h3 { font-size: 14px; margin-bottom: 12px; color: var(--text-dim); }
+  .chart-box canvas { width: 100% !important; }
+
+  /* Tables row */
+  .table-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  .table-box {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px; overflow-x: auto;
+  }
+  .table-box h3 { font-size: 14px; margin-bottom: 12px; color: var(--text-dim); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); color: var(--text-dim); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  td { padding: 8px 6px; border-bottom: 1px solid var(--border); }
+  tr:hover { background: rgba(88,166,255,0.05); }
+
+  /* OB Detail */
+  .ob-section {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  .ob-section h3 { font-size: 14px; margin-bottom: 12px; color: var(--text-dim); }
+  .ob-controls { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
+  select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 12px; font-size: 13px; min-width: 300px;
+  }
+  .ob-charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+  /* Responsive */
+  @media (max-width: 900px) {
+    .chart-row, .table-row, .ob-charts { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <!-- Header -->
+  <div class="header">
+    <h1>Polymarket Bot</h1>
+    <div class="status">
+      <span id="mode-badge" class="badge badge-paper">PAPER</span>
+      <span id="last-scan">Last scan: --</span>
+      <div class="pulse" title="Auto-refreshing every 10s"></div>
+    </div>
+  </div>
+
+  <!-- Summary Cards -->
+  <div class="cards">
+    <div class="card"><div class="label">Total P&L</div><div class="value" id="card-pnl">--</div></div>
+    <div class="card"><div class="label">Total Exposure</div><div class="value" id="card-exposure">--</div></div>
+    <div class="card"><div class="label">Open Positions</div><div class="value" id="card-positions">--</div></div>
+    <div class="card"><div class="label">Markets Scanned</div><div class="value" id="card-markets">--</div><div class="sub" id="card-markets-sub"></div></div>
+    <div class="card"><div class="label">Orders Placed</div><div class="value" id="card-orders">--</div><div class="sub" id="card-orders-sub"></div></div>
+    <div class="card"><div class="label">Win Rate</div><div class="value" id="card-winrate">--</div></div>
+  </div>
+
+  <!-- Charts -->
+  <div class="chart-row">
+    <div class="chart-box">
+      <h3>Scan Activity</h3>
+      <canvas id="scanChart"></canvas>
+    </div>
+    <div class="chart-box">
+      <h3>P&L by Position</h3>
+      <canvas id="pnlChart"></canvas>
+    </div>
+  </div>
+
+  <!-- Tables -->
+  <div class="table-row">
+    <div class="table-box">
+      <h3>Open Positions</h3>
+      <table>
+        <thead><tr><th>Market</th><th>Side</th><th>Size</th><th>Avg Price</th><th>Current</th><th>P&L</th><th>Age</th></tr></thead>
+        <tbody id="positions-tbody"></tbody>
+      </table>
+    </div>
+    <div class="table-box">
+      <h3>Recent Orders</h3>
+      <table>
+        <thead><tr><th>Order ID</th><th>Market</th><th>Side</th><th>Price</th><th>Size</th><th>Status</th><th>Time</th></tr></thead>
+        <tbody id="orders-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- OB Snapshot Detail -->
+  <div class="ob-section">
+    <h3>Order Book Snapshot Detail</h3>
+    <div class="ob-controls">
+      <select id="ob-market-select"><option value="">Select a market...</option></select>
+    </div>
+    <div class="ob-charts">
+      <div class="chart-box">
+        <h3>OB Trend (Mid / Bid / Ask)</h3>
+        <canvas id="obTrendChart"></canvas>
+      </div>
+      <div class="chart-box">
+        <h3>Spread & Imbalance</h3>
+        <canvas id="obSpreadChart"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Helpers ──────────────────────────────────────────────────────────
+function timeAgo(ts) {
+  if (!ts) return '--';
+  const diff = Date.now() / 1000 - ts;
+  if (diff < 60) return Math.floor(diff) + 's ago';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+  return Math.floor(diff / 86400) + 'd ago';
+}
+function fmtTime(ts) {
+  if (!ts) return '--';
+  return new Date(ts * 1000).toLocaleString();
+}
+function pnlClass(v) { return v >= 0 ? 'pnl-pos' : 'pnl-neg'; }
+function pnlStr(v) { return (v >= 0 ? '+' : '') + v.toFixed(4); }
+function truncate(s, n) { return s && s.length > n ? s.slice(0, n) + '...' : (s || '--'); }
+async function api(path) {
+  const r = await fetch(path);
+  return r.json();
+}
+
+// Safe DOM helpers — avoid innerHTML with external data
+function clearChildren(el) {
+  while (el.firstChild) el.removeChild(el.firstChild);
+}
+function td(text, opts) {
+  const cell = document.createElement('td');
+  cell.textContent = text;
+  if (opts && opts.className) cell.className = opts.className;
+  if (opts && opts.title) cell.title = opts.title;
+  return cell;
+}
+
+// ── Chart defaults ──────────────────────────────────────────────────
+Chart.defaults.color = '#8b949e';
+Chart.defaults.borderColor = '#30363d';
+Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, sans-serif';
+Chart.defaults.font.size = 11;
+
+let scanChart, pnlChart, obTrendChart, obSpreadChart;
+
+function initCharts() {
+  scanChart = new Chart(document.getElementById('scanChart'), {
+    type: 'line',
+    data: { labels: [], datasets: [
+      { label: 'Markets Found', data: [], borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,0.1)', fill: true, tension: 0.3 },
+      { label: 'With Edge', data: [], borderColor: '#3fb950', backgroundColor: 'rgba(63,185,80,0.1)', fill: true, tension: 0.3 },
+      { label: 'Orders', data: [], borderColor: '#d29922', backgroundColor: 'rgba(210,153,34,0.1)', fill: true, tension: 0.3 },
+    ]},
+    options: { responsive: true, plugins: { legend: { position: 'bottom' } }, scales: { x: { display: true }, y: { beginAtZero: true } } }
+  });
+
+  pnlChart = new Chart(document.getElementById('pnlChart'), {
+    type: 'bar',
+    data: { labels: [], datasets: [{ label: 'P&L', data: [], backgroundColor: [] }] },
+    options: { indexAxis: 'y', responsive: true, plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true } } }
+  });
+
+  obTrendChart = new Chart(document.getElementById('obTrendChart'), {
+    type: 'line',
+    data: { labels: [], datasets: [
+      { label: 'Mid', data: [], borderColor: '#58a6ff', tension: 0.3 },
+      { label: 'Best Bid', data: [], borderColor: '#3fb950', tension: 0.3 },
+      { label: 'Best Ask', data: [], borderColor: '#f85149', tension: 0.3 },
+    ]},
+    options: { responsive: true, plugins: { legend: { position: 'bottom' } } }
+  });
+
+  obSpreadChart = new Chart(document.getElementById('obSpreadChart'), {
+    type: 'line',
+    data: { labels: [], datasets: [
+      { label: 'Spread', data: [], borderColor: '#d29922', yAxisID: 'y', tension: 0.3 },
+      { label: 'Imbalance', data: [], borderColor: '#bc8cff', yAxisID: 'y1', tension: 0.3 },
+    ]},
+    options: {
+      responsive: true,
+      plugins: { legend: { position: 'bottom' } },
+      scales: {
+        y: { position: 'left', title: { display: true, text: 'Spread' } },
+        y1: { position: 'right', title: { display: true, text: 'Imbalance' }, grid: { drawOnChartArea: false } },
+      }
+    }
+  });
+}
+
+// ── Data loaders ────────────────────────────────────────────────────
+async function loadSummary() {
+  const d = await api('/api/summary');
+  const el = id => document.getElementById(id);
+
+  const pnlEl = el('card-pnl');
+  pnlEl.textContent = '$' + pnlStr(d.total_pnl);
+  pnlEl.className = 'value ' + pnlClass(d.total_pnl);
+
+  el('card-exposure').textContent = '$' + d.total_exposure.toFixed(2);
+  el('card-positions').textContent = d.open_positions;
+  el('card-winrate').textContent = d.win_rate + '%';
+
+  if (d.last_scan) {
+    el('card-markets').textContent = d.last_scan.markets_found;
+    el('card-markets-sub').textContent = 'last scan';
+    el('card-orders').textContent = d.last_scan.orders_placed;
+    el('card-orders-sub').textContent = 'last scan';
+    const scanEl = el('last-scan');
+    scanEl.textContent = 'Last scan: ' + timeAgo(d.last_scan.scan_time);
+    scanEl.title = fmtTime(d.last_scan.scan_time);
+  }
+  const badge = el('mode-badge');
+  if (d.paper_mode) {
+    badge.textContent = 'PAPER'; badge.className = 'badge badge-paper';
+  } else {
+    badge.textContent = 'LIVE'; badge.className = 'badge badge-live';
+  }
+}
+
+async function loadScans() {
+  const data = await api('/api/scans?limit=100');
+  const sorted = data.reverse();
+  scanChart.data.labels = sorted.map(s => timeAgo(s.scan_time));
+  scanChart.data.datasets[0].data = sorted.map(s => s.markets_found);
+  scanChart.data.datasets[1].data = sorted.map(s => s.markets_with_edge);
+  scanChart.data.datasets[2].data = sorted.map(s => s.orders_placed);
+  scanChart.update('none');
+}
+
+async function loadPositions() {
+  const data = await api('/api/positions');
+
+  // P&L chart
+  pnlChart.data.labels = data.map(p => truncate(p.question || p.condition_id, 30));
+  pnlChart.data.datasets[0].data = data.map(p => p.pnl);
+  pnlChart.data.datasets[0].backgroundColor = data.map(p => p.pnl >= 0 ? '#3fb950' : '#f85149');
+  pnlChart.update('none');
+
+  // Table — safe DOM construction
+  const tbody = document.getElementById('positions-tbody');
+  clearChildren(tbody);
+  data.forEach(p => {
+    const tr = document.createElement('tr');
+    tr.appendChild(td(truncate(p.question || p.condition_id, 35), { title: p.condition_id }));
+    tr.appendChild(td(p.token_choice || p.side || '--'));
+    tr.appendChild(td(p.size.toFixed(2)));
+    tr.appendChild(td(p.avg_price.toFixed(4)));
+    tr.appendChild(td((p.current_price || 0).toFixed(4)));
+    tr.appendChild(td(pnlStr(p.pnl), { className: pnlClass(p.pnl) }));
+    tr.appendChild(td(timeAgo(p.opened_at), { title: fmtTime(p.opened_at) }));
+    tbody.appendChild(tr);
+  });
+}
+
+async function loadOrders() {
+  const data = await api('/api/orders?limit=50');
+  const tbody = document.getElementById('orders-tbody');
+  clearChildren(tbody);
+  data.forEach(o => {
+    const tr = document.createElement('tr');
+    tr.appendChild(td(truncate(o.order_id, 10), { title: o.order_id }));
+    tr.appendChild(td(truncate(o.question || o.condition_id, 25), { title: o.condition_id }));
+    tr.appendChild(td(o.side));
+    tr.appendChild(td(o.price.toFixed(4)));
+    tr.appendChild(td(o.size.toFixed(2)));
+    tr.appendChild(td(o.status));
+    tr.appendChild(td(timeAgo(o.created_at), { title: fmtTime(o.created_at) }));
+    tbody.appendChild(tr);
+  });
+}
+
+async function loadOBMarkets() {
+  const sel = document.getElementById('ob-market-select');
+  const current = sel.value;
+
+  const [positions, latest] = await Promise.all([
+    api('/api/positions'),
+    api('/api/ob-snapshots/latest?limit=50'),
+  ]);
+
+  const markets = new Map();
+  positions.forEach(p => markets.set(p.condition_id, p.question || p.condition_id));
+  latest.forEach(s => { if (!markets.has(s.condition_id)) markets.set(s.condition_id, s.question || s.condition_id); });
+
+  // Rebuild dropdown safely
+  clearChildren(sel);
+  const defaultOpt = document.createElement('option');
+  defaultOpt.value = '';
+  defaultOpt.textContent = 'Select a market...';
+  sel.appendChild(defaultOpt);
+
+  markets.forEach((label, cid) => {
+    const opt = document.createElement('option');
+    opt.value = cid;
+    opt.textContent = truncate(label, 60);
+    sel.appendChild(opt);
+  });
+
+  if (current && markets.has(current)) sel.value = current;
+}
+
+async function loadOBDetail(conditionId) {
+  if (!conditionId) return;
+  const data = await api('/api/ob-snapshots?condition_id=' + encodeURIComponent(conditionId) + '&limit=200');
+  const sorted = data.reverse();
+
+  const labels = sorted.map(s => timeAgo(s.snapshot_time));
+  obTrendChart.data.labels = labels;
+  obTrendChart.data.datasets[0].data = sorted.map(s => s.mid_price);
+  obTrendChart.data.datasets[1].data = sorted.map(s => s.best_bid);
+  obTrendChart.data.datasets[2].data = sorted.map(s => s.best_ask);
+  obTrendChart.update('none');
+
+  obSpreadChart.data.labels = labels;
+  obSpreadChart.data.datasets[0].data = sorted.map(s => s.spread);
+  obSpreadChart.data.datasets[1].data = sorted.map(s => s.imbalance);
+  obSpreadChart.update('none');
+}
+
+// ── Refresh loop ────────────────────────────────────────────────────
+async function refreshAll() {
+  try {
+    await Promise.all([loadSummary(), loadScans(), loadPositions(), loadOrders(), loadOBMarkets()]);
+    const sel = document.getElementById('ob-market-select');
+    if (sel.value) await loadOBDetail(sel.value);
+  } catch (e) {
+    console.error('Refresh error:', e);
+  }
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  initCharts();
+  refreshAll();
+  setInterval(refreshAll, 10000);
+
+  document.getElementById('ob-market-select').addEventListener('change', function(e) {
+    loadOBDetail(e.target.value);
+  });
+});
+</script>
+</body>
+</html>

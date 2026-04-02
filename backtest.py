@@ -1,14 +1,19 @@
 """
-Backtest: validate the OB-imbalance → Kelly strategy against resolved markets.
+Backtest: calibration sweep — "how accurate must the OB signal be for the strategy to profit?"
 
-Fetches ~500 resolved markets from the Gamma API and simulates trades at
-multiple entry prices and synthetic OB imbalance levels.  The known resolution
-(Yes=1 or No=1) provides ground-truth P&L.
+Fetches resolved markets from the Gamma API and, for each signal-accuracy level,
+simulates trades where the signal points toward the winning side with
+probability = accuracy.  The known resolution provides ground-truth P&L.
+
+This replaces the previous Monte Carlo random-imbalance approach which was
+tautological (symmetric draws produced 50/50 wins by construction).
 
 Usage:
-    python3 backtest.py                  # full backtest (~500 markets)
-    python3 backtest.py --markets 50     # quick test with fewer markets
-    python3 backtest.py --dry-run        # fetch markets only, no simulation
+    python3 backtest.py                       # full calibration sweep
+    python3 backtest.py --markets 100         # fewer markets for speed
+    python3 backtest.py --accuracy 0.60       # single accuracy level
+    python3 backtest.py --ob-weight 0.10      # higher OB sensitivity
+    python3 backtest.py --dry-run             # fetch markets only, no sim
 """
 
 import argparse
@@ -16,6 +21,7 @@ import asyncio
 import json
 import logging
 import math
+import random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -24,6 +30,7 @@ from typing import List, Optional
 import aiohttp
 
 from kelly import kelly_criterion
+from market_scanner import classify_market, MarketCategory
 
 logger = logging.getLogger("backtest")
 
@@ -31,7 +38,7 @@ GAMMA_URL = "https://gamma-api.polymarket.com"
 
 # Simulation grid
 ENTRY_PRICES = [0.30, 0.40, 0.50, 0.60, 0.70]
-IMBALANCE_LEVELS = [-0.30, -0.10, 0.00, 0.10, 0.30]
+ACCURACY_LEVELS = [0.50, 0.52, 0.55, 0.60, 0.65, 0.70]
 
 # Strategy defaults (mirror BotConfig)
 DEFAULT_BANKROLL = 1000.0
@@ -42,17 +49,7 @@ OB_WEIGHT = 0.05
 SPREAD = 0.02  # 2 cents — realistic tight spread
 SLIPPAGE_SPREAD_BPS = 50
 SLIPPAGE_IMPACT_BPS = 10
-
-# Category keywords (simplified version of market_scanner.py)
-CATEGORY_KEYWORDS = {
-    "crypto": ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "blockchain"],
-    "politics": ["election", "president", "congress", "trump", "biden", "vote", "democrat", "republican"],
-    "sports": ["nfl", "nba", "mlb", "nhl", "soccer", "football", "basketball", "super bowl"],
-    "entertainment": ["oscar", "grammy", "emmy", "movie", "film", "tv show"],
-    "science": ["nasa", "space", "climate", "vaccine", "fda"],
-    "finance": ["fed", "interest rate", "inflation", "gdp", "stock", "s&p", "nasdaq"],
-}
-
+DEFAULT_TRIALS = 20  # draws per (market, entry_price) at each accuracy level
 
 @dataclass
 class BacktestTrade:
@@ -71,6 +68,7 @@ class BacktestTrade:
 @dataclass
 class BacktestReport:
     markets: int = 0
+    total_simulations: int = 0
     trades: List[BacktestTrade] = field(default_factory=list)
 
     @property
@@ -118,15 +116,6 @@ class BacktestReport:
         return worst_dd
 
 
-def classify_market(question: str) -> str:
-    q_lower = question.lower()
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        for kw in keywords:
-            if kw in q_lower:
-                return category
-    return "other"
-
-
 def ob_imbalance_prob(
     mid: float,
     bid_depth: float,
@@ -158,14 +147,10 @@ def simulate_trade(
     Returns None if Kelly finds no edge (the strategy correctly passes).
     """
     # Build synthetic order book
-    half_spread = SPREAD / 2
-    best_bid = entry_price - half_spread
-    best_ask = entry_price + half_spread
     mid = entry_price
 
-    # Derive bid/ask depth from liquidity and imbalance
-    # Total depth is a fraction of the market's reported liquidity
-    total_depth = max(liquidity * 0.1, 100.0)  # at least $100 each side
+    # Derive bid/ask depth from volume (liquidity proxy) and imbalance
+    total_depth = max(liquidity * 0.1, 100.0)
     # imbalance = (bid - ask) / (bid + ask)  →  bid = total*(1+imb)/2
     bid_depth = total_depth * (1 + imbalance) / 2
     ask_depth = total_depth * (1 - imbalance) / 2
@@ -185,16 +170,20 @@ def simulate_trade(
     if result is None:
         return None  # no edge — strategy correctly passes
 
-    # Apply paper slippage model (same as bot.py)
+    # Apply paper slippage model (same sqrt model as bot.py)
     nominal_price = mid
     size_tokens = result.position_size / nominal_price if nominal_price > 0 else 0
     spread_cost = SLIPPAGE_SPREAD_BPS / 10_000
-    impact = SLIPPAGE_IMPACT_BPS / 10_000 * size_tokens
+    depth = ask_depth if result.side == "BUY" else bid_depth
+    if depth > 0:
+        impact = spread_cost * math.sqrt(size_tokens / depth)
+    else:
+        impact = spread_cost
 
     if result.side == "BUY":
-        fill_price = min(nominal_price + spread_cost + impact, 0.99)
+        fill_price = min(nominal_price + impact, 0.99)
     else:
-        fill_price = max(nominal_price - spread_cost - impact, 0.01)
+        fill_price = max(nominal_price - impact, 0.01)
 
     # P&L from known resolution
     token = result.token_choice  # "YES" or "NO"
@@ -205,7 +194,7 @@ def simulate_trade(
         else:
             pnl = -result.position_size
     else:
-        # Bought NO tokens at (1 - fill_price equivalent)
+        # Bought NO tokens; effective cost is (1 - fill_price)
         no_fill = 1.0 - fill_price
         if not resolved_yes:
             pnl = (1.0 - no_fill) * result.position_size / no_fill
@@ -221,7 +210,7 @@ def simulate_trade(
         size=result.position_size,
         resolved_yes=resolved_yes,
         pnl=round(pnl, 4),
-        imbalance=imbalance,
+        imbalance=round(imbalance, 4),
         category=category,
     )
 
@@ -287,82 +276,115 @@ def parse_resolution(market: dict) -> Optional[bool]:
         return None
 
 
-def imbalance_aligns_with_outcome(imbalance: float, resolved_yes: bool) -> Optional[str]:
-    """Classify whether the imbalance direction aligned with the actual outcome."""
-    if abs(imbalance) < 0.05:
-        return "neutral"
-    # Positive imbalance (bid > ask) → market expects YES
-    if imbalance > 0 and resolved_yes:
-        return "aligns"
-    if imbalance < 0 and not resolved_yes:
-        return "aligns"
-    return "opposes"
+def run_calibration_backtest(
+    valid_markets: list,
+    accuracy: float,
+    n_trials: int,
+    ob_weight: float,
+    min_edge: float,
+    rng: random.Random,
+) -> BacktestReport:
+    """Run backtest at a single accuracy level.
+
+    For each (market, entry_price, trial):
+    - With probability=accuracy: imbalance points toward the winning side
+    - With probability=1-accuracy: imbalance points the wrong way
+    - Imbalance magnitude drawn from Uniform(0.2, 0.3) to clear min_edge
+    """
+    report = BacktestReport()
+    report.markets = len(valid_markets)
+    report.total_simulations = report.markets * len(ENTRY_PRICES) * n_trials
+
+    for m, resolved_yes, volume in valid_markets:
+        cid = m.get("conditionId", "unknown")
+        question = m.get("question", "?")
+        category = classify_market(question)
+
+        for entry_price in ENTRY_PRICES:
+            for _ in range(n_trials):
+                # Draw imbalance magnitude — must be large enough that
+                # magnitude * ob_weight >= min_edge, otherwise Kelly never
+                # finds an edge.  With default ob_weight=0.05 and min_edge=0.02,
+                # the minimum magnitude is 0.40.
+                min_magnitude = min_edge / ob_weight if ob_weight > 0 else 0.40
+                magnitude = rng.uniform(min_magnitude, min_magnitude + 0.20)
+
+                # With probability=accuracy, signal is correct
+                correct = rng.random() < accuracy
+
+                if correct:
+                    # Signal points toward the winner
+                    imbalance = magnitude if resolved_yes else -magnitude
+                else:
+                    # Signal points the wrong way
+                    imbalance = -magnitude if resolved_yes else magnitude
+
+                trade = simulate_trade(
+                    condition_id=cid,
+                    question=question,
+                    entry_price=entry_price,
+                    imbalance=imbalance,
+                    resolved_yes=resolved_yes,
+                    category=category,
+                    liquidity=volume,
+                    ob_weight=ob_weight,
+                    min_edge=min_edge,
+                )
+                if trade is not None:
+                    report.trades.append(trade)
+
+    return report
 
 
-def print_report(report: BacktestReport) -> None:
-    trades = report.trades
-    n = len(trades)
+def print_calibration_report(
+    results: list,
+    n_markets: int,
+    n_trials: int,
+    ob_weight: float,
+    min_edge: float,
+) -> None:
+    """Print the accuracy-sweep calibration table."""
+    print("\n" + "=" * 60)
+    print("  CALIBRATION BACKTEST  (required signal accuracy)")
+    print("=" * 60)
+    print(f"  Markets: {n_markets} | Entry prices: {len(ENTRY_PRICES)} | "
+          f"Trials per combo: {n_trials}")
+    print(f"  ob_weight={ob_weight}, min_edge={min_edge}, "
+          f"kelly_fraction={KELLY_FRACTION}, bankroll=${DEFAULT_BANKROLL:.0f}")
+    print()
+    print(f"  {'Accuracy':>8s}  {'Trades':>6s}  {'Win Rate':>8s}  "
+          f"{'Total P&L':>10s}  {'Avg P&L':>8s}  {'Sharpe':>6s}")
+    print(f"  {'─' * 8}  {'─' * 6}  {'─' * 8}  {'─' * 10}  {'─' * 8}  {'─' * 6}")
 
-    print("\n" + "=" * 55)
-    print("  BACKTEST RESULTS")
-    print("=" * 55)
-    print(f"  Markets:       {report.markets}")
-    print(f"  Trades:        {n} (out of {report.markets * len(ENTRY_PRICES) * len(IMBALANCE_LEVELS)} simulations)")
+    breakeven_accuracy = None
+    min_viable_accuracy = None
 
-    if n == 0:
-        print("  No trades generated — Kelly found no edge in any simulation.")
-        max_imb = max(abs(i) for i in IMBALANCE_LEVELS)
-        max_adj = max_imb * OB_WEIGHT
-        print(f"\n  Diagnostic: max |imbalance|={max_imb:.2f} × ob_weight={OB_WEIGHT} "
-              f"= {max_adj:.4f} edge")
-        print(f"  But min_edge={MIN_EDGE} — OB imbalance alone cannot clear this threshold.")
-        print(f"\n  Try:  python3 backtest.py --ob-weight 0.10")
-        print(f"    or: python3 backtest.py --min-edge 0.01")
-        print("=" * 55)
-        return
+    for accuracy, report in results:
+        n = len(report.trades)
+        wr = report.win_rate
+        total = report.total_pnl
+        avg = report.avg_pnl
+        sharpe = report.sharpe
 
-    print(f"  Win Rate:      {report.win_rate:.1%}")
-    print(f"  Total P&L:     ${report.total_pnl:,.2f}")
-    print(f"  Avg P&L:       ${report.avg_pnl:.2f} per trade")
-    print(f"  Sharpe:        {report.sharpe:.2f}")
-    print(f"  Max Drawdown:  ${report.max_drawdown:,.2f}")
+        print(f"  {accuracy:>7.0%}  {n:>6d}  {wr:>7.1%}  "
+              f"${total:>9,.2f}  ${avg:>7.2f}  {sharpe:>6.2f}")
 
-    # --- By Imbalance Direction ---
-    print(f"\n{'--- By Imbalance Direction ---':^55}")
-    buckets = {"aligns": [], "opposes": [], "neutral": []}
-    for t in trades:
-        label = imbalance_aligns_with_outcome(t.imbalance, t.resolved_yes)
-        if label:
-            buckets[label].append(t)
+        if breakeven_accuracy is None and sharpe > 0.5:
+            breakeven_accuracy = accuracy
+        if min_viable_accuracy is None and total > 0:
+            min_viable_accuracy = accuracy
 
-    for label in ("aligns", "opposes", "neutral"):
-        b = buckets[label]
-        if b:
-            wr = sum(1 for t in b if t.pnl > 0) / len(b)
-            avg = sum(t.pnl for t in b) / len(b)
-            print(f"  {label:>20s}:  {len(b):>4d} trades, {wr:.1%} win rate, avg P&L ${avg:.2f}")
-        else:
-            print(f"  {label:>20s}:  0 trades")
-
-    # --- By Entry Price ---
-    print(f"\n{'--- By Entry Price ---':^55}")
-    for ep in ENTRY_PRICES:
-        subset = [t for t in trades if abs(t.entry_price - ep) < 0.01]
-        if subset:
-            total = sum(t.pnl for t in subset)
-            wr = sum(1 for t in subset if t.pnl > 0) / len(subset)
-            print(f"  {ep:.2f}:  {len(subset):>4d} trades, ${total:>9,.2f} P&L, {wr:.1%} win rate")
-
-    # --- By Category ---
-    print(f"\n{'--- By Category ---':^55}")
-    cats = sorted(set(t.category for t in trades))
-    for cat in cats:
-        subset = [t for t in trades if t.category == cat]
-        total = sum(t.pnl for t in subset)
-        wr = sum(1 for t in subset if t.pnl > 0) / len(subset)
-        print(f"  {cat:>15s}:  {len(subset):>4d} trades, ${total:>9,.2f} P&L, {wr:.1%} win rate")
-
-    print("=" * 55)
+    print()
+    if breakeven_accuracy is not None:
+        print(f"  -> Breakeven accuracy: ~{breakeven_accuracy:.0%} (Sharpe > 0.5)")
+    else:
+        print(f"  -> Breakeven accuracy: not reached in sweep")
+    if min_viable_accuracy is not None:
+        print(f"  -> Minimum viable accuracy: ~{min_viable_accuracy:.0%} "
+              f"(covers slippage + fees)")
+    else:
+        print(f"  -> Minimum viable accuracy: not reached in sweep")
+    print("=" * 60)
 
 
 async def run_backtest(
@@ -370,16 +392,19 @@ async def run_backtest(
     dry_run: bool = False,
     ob_weight: float = OB_WEIGHT,
     min_edge: float = MIN_EDGE,
-) -> BacktestReport:
-    report = BacktestReport()
+    n_trials: int = DEFAULT_TRIALS,
+    seed: int = 42,
+    single_accuracy: Optional[float] = None,
+) -> Optional[list]:
+    """Fetch markets and run calibration sweep.
 
+    Returns list of (accuracy, BacktestReport) tuples, or None for dry_run.
+    """
     logger.info("Fetching up to %d resolved markets from Gamma API...", n_markets)
     raw_markets = await fetch_resolved_markets(n_markets)
     logger.info("Fetched %d raw markets", len(raw_markets))
 
     # Filter to cleanly resolved binary markets
-    # Resolved markets have liquidity=0 (trading ended), so use volume as
-    # the proxy for historical depth in the synthetic order book.
     valid_markets = []
     for m in raw_markets:
         resolved_yes = parse_resolution(m)
@@ -390,59 +415,56 @@ async def run_backtest(
             continue
         valid_markets.append((m, resolved_yes, volume))
 
-    report.markets = len(valid_markets)
-    logger.info("Valid resolved markets: %d", report.markets)
+    n_valid = len(valid_markets)
+    logger.info("Valid resolved markets: %d", n_valid)
 
     if dry_run:
-        print(f"\n[DRY RUN] {report.markets} valid resolved markets found.")
+        yes_count = sum(1 for _, r, _ in valid_markets if r)
+        no_count = n_valid - yes_count
+        print(f"\n[DRY RUN] {n_valid} valid resolved markets "
+              f"(YES: {yes_count}, NO: {no_count})")
         for m, res, vol in valid_markets[:10]:
-            q = m.get("question", "?")[:70]
+            q = m.get("question", "?")[:65]
             print(f"  {'YES' if res else 'NO ':>3s} resolved | vol=${vol:>10,.0f} | {q}")
-        return report
+        return None
 
-    # Run simulation grid
+    accuracies = [single_accuracy] if single_accuracy else ACCURACY_LEVELS
+    results = []
+
     t0 = time.time()
-    for m, resolved_yes, volume in valid_markets:
-        cid = m.get("conditionId", "unknown")
-        question = m.get("question", "?")
-        category = classify_market(question)
-
-        for entry_price in ENTRY_PRICES:
-            for imbalance in IMBALANCE_LEVELS:
-                trade = simulate_trade(
-                    condition_id=cid,
-                    question=question,
-                    entry_price=entry_price,
-                    imbalance=imbalance,
-                    resolved_yes=resolved_yes,
-                    category=category,
-                    liquidity=volume,  # use historical volume as depth proxy
-                    ob_weight=ob_weight,
-                    min_edge=min_edge,
-                )
-                if trade is not None:
-                    report.trades.append(trade)
+    for accuracy in accuracies:
+        rng = random.Random(seed)
+        logger.info("Running accuracy=%.0f%% ...", accuracy * 100)
+        report = run_calibration_backtest(
+            valid_markets, accuracy, n_trials, ob_weight, min_edge, rng,
+        )
+        results.append((accuracy, report))
+        logger.info("  accuracy=%.0f%%: %d trades, P&L=$%.2f, Sharpe=%.2f",
+                     accuracy * 100, len(report.trades),
+                     report.total_pnl, report.sharpe)
 
     elapsed = time.time() - t0
-    logger.info("Simulation complete: %d trades in %.1fs", len(report.trades), elapsed)
-    return report
-
-
-def print_params(ob_weight: float, min_edge: float) -> None:
-    print(f"\n  Parameters: ob_weight={ob_weight}, min_edge={min_edge}, "
-          f"kelly_fraction={KELLY_FRACTION}, bankroll=${DEFAULT_BANKROLL:.0f}")
-    max_imb = max(abs(i) for i in IMBALANCE_LEVELS)
-    max_adj = max_imb * ob_weight
-    can_trade = "YES" if max_adj >= min_edge else "NO"
-    print(f"  Max edge from OB imbalance: {max_imb:.2f} × {ob_weight} = {max_adj:.4f} "
-          f"(>= min_edge {min_edge}? {can_trade})")
+    total_trades = sum(len(r.trades) for _, r in results)
+    logger.info("Calibration sweep complete: %d total trades in %.1fs",
+                total_trades, elapsed)
+    return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Backtest OB-imbalance + Kelly strategy on resolved markets")
-    parser.add_argument("--markets", type=int, default=500, help="Number of resolved markets to fetch (default: 500)")
-    parser.add_argument("--dry-run", action="store_true", help="Fetch markets only, skip simulation")
-    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    parser = argparse.ArgumentParser(
+        description="Calibration backtest: required OB signal accuracy for profitability")
+    parser.add_argument("--markets", type=int, default=500,
+                        help="Number of resolved markets to fetch (default: 500)")
+    parser.add_argument("--trials", type=int, default=DEFAULT_TRIALS,
+                        help=f"Draws per (market, price) at each accuracy (default: {DEFAULT_TRIALS})")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility (default: 42)")
+    parser.add_argument("--accuracy", type=float, default=None,
+                        help="Single accuracy level to test (default: sweep all)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Fetch markets only, skip simulation")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable debug logging")
     parser.add_argument("--ob-weight", type=float, default=OB_WEIGHT,
                         help=f"OB imbalance weight (default: {OB_WEIGHT}, bot default)")
     parser.add_argument("--min-edge", type=float, default=MIN_EDGE,
@@ -456,16 +478,22 @@ def main():
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
-    print_params(args.ob_weight, args.min_edge)
-
-    report = asyncio.run(run_backtest(
+    results = asyncio.run(run_backtest(
         n_markets=args.markets,
         dry_run=args.dry_run,
         ob_weight=args.ob_weight,
         min_edge=args.min_edge,
+        n_trials=args.trials,
+        seed=args.seed,
+        single_accuracy=args.accuracy,
     ))
-    if not args.dry_run:
-        print_report(report)
+    if results is not None:
+        # Use market count from first report
+        n_markets = results[0][1].markets if results else 0
+        print_calibration_report(
+            results, n_markets, args.trials,
+            args.ob_weight, args.min_edge,
+        )
 
 
 if __name__ == "__main__":

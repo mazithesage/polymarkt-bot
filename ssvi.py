@@ -6,6 +6,7 @@ References:
   Gatheral (2004), "A parsimonious arbitrage-free implied volatility parameterization"
 """
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -13,6 +14,8 @@ from typing import Optional, Tuple
 import numpy as np
 from scipy.optimize import minimize
 from scipy.stats import norm
+
+logger = logging.getLogger("polymarket-bot")
 
 # Bounds on fitted parameters
 MIN_VARIANCE = 1e-6
@@ -97,7 +100,7 @@ def fit_ssvi(
         best_result = minimize(objective, x0, method="L-BFGS-B", bounds=bounds,
                                options={"maxiter": 500})
     except Exception:
-        pass
+        logger.debug("SSVI primary L-BFGS-B pass failed", exc_info=True)
 
     # If first pass failed or got stuck, perturb and retry once
     if best_result is None or best_result.fun > 1e-4:
@@ -110,7 +113,7 @@ def fit_ssvi(
             if best_result is None or result2.fun < best_result.fun:
                 best_result = result2
         except Exception:
-            pass
+            logger.debug("SSVI perturbed L-BFGS-B pass failed", exc_info=True)
 
     # Last resort — Nelder-Mead (unbounded, slower, but robust)
     if best_result is None:

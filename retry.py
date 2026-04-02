@@ -39,8 +39,8 @@ async def retry_request(
             if attempt < max_retries:
                 delay = _compute_delay(resp, attempt, base_delay)
                 logger.warning(
-                    f"Retryable HTTP {resp.status} on {method} {url}, "
-                    f"attempt {attempt + 1}/{max_retries}, sleeping {delay:.1f}s"
+                    "Retryable HTTP %d on %s %s, attempt %d/%d, sleeping %.1fs",
+                    resp.status, method, url, attempt + 1, max_retries, delay,
                 )
                 await asyncio.sleep(delay)
             continue
@@ -50,8 +50,8 @@ async def retry_request(
             if attempt < max_retries:
                 delay = base_delay * (2 ** attempt)
                 logger.warning(
-                    f"Request error on {method} {url}: {e}, "
-                    f"attempt {attempt + 1}/{max_retries}, sleeping {delay:.1f}s"
+                    "Request error on %s %s: %s, attempt %d/%d, sleeping %.1fs",
+                    method, url, e, attempt + 1, max_retries, delay,
                 )
                 await asyncio.sleep(delay)
             continue

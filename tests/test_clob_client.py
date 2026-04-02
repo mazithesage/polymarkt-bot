@@ -144,6 +144,34 @@ class TestEIP712Signing:
         assert sign_order(msg1, self.PRIVATE_KEY) != sign_order(msg2, self.PRIVATE_KEY)
 
 
+class TestNonNumericTokenId:
+    def test_non_numeric_token_id_logs_warning(self, caplog):
+        """Non-numeric token_id should log a warning and use tokenId=0."""
+        import logging
+        order = Order(token_id="abc-not-numeric", side=Side.BUY, price=0.50, size=10.0)
+        with caplog.at_level(logging.WARNING, logger="polymarket-bot"):
+            msg = build_order_message(
+                order,
+                maker="0x" + "00" * 20,
+                signer="0x" + "00" * 20,
+            )
+        assert msg["tokenId"] == 0
+        assert "Non-numeric token_id" in caplog.text
+
+    def test_numeric_token_id_no_warning(self, caplog):
+        """Numeric token_id should not log any warning."""
+        import logging
+        order = Order(token_id="12345", side=Side.BUY, price=0.50, size=10.0)
+        with caplog.at_level(logging.WARNING, logger="polymarket-bot"):
+            msg = build_order_message(
+                order,
+                maker="0x" + "00" * 20,
+                signer="0x" + "00" * 20,
+            )
+        assert msg["tokenId"] == 12345
+        assert "Non-numeric" not in caplog.text
+
+
 class TestHMACAuth:
     def test_hmac_signature_deterministic(self):
         sig1 = create_hmac_signature("secret", "12345", "GET", "/book")

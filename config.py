@@ -124,7 +124,7 @@ def load_config() -> Tuple[ClobConfig, ChainConfig, BotConfig]:
         proxy_address=os.getenv("PROXY_ADDRESS", ""),
     )
     bot = BotConfig(
-        paper_mode=os.getenv("PAPER_MODE", "true").lower() == "true",
+        paper_mode=os.getenv("PAPER_MODE", "true").lower() in ("true", "1", "yes", "on"),
         scan_interval=int(os.getenv("SCAN_INTERVAL_SECONDS", "60")),
         max_position_usdc=float(os.getenv("MAX_POSITION_USDC", "100.0")),
         kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),

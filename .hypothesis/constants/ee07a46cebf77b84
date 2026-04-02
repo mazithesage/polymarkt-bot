@@ -1,0 +1,4 @@
+# file: /Users/mac/Documents/GitHub/polymarkt-bot/bot.py
+# hypothesis_version: 6.141.1
+
+[0.0, 1e-09, 0.005, 0.01, 0.99, 10000, '--live', '--log-level', '--once', '--paper', 'BUY', 'FILLED', 'Force live mode', 'Force paper mode', 'INFO', 'LIVE', 'Log level override', 'PAPER', 'PAPER_FILLED', 'Scan cycle error: %s', 'YES', '__main__', 'condition_id', 'edge', 'errors', 'event', 'exception', 'json', 'level', 'log_level', 'logger', 'market', 'markets_found', 'markets_with_edge', 'msg', 'order_id', 'orders_placed', 'paper_mode', 'polymarket-bot', 'price', 'side', 'size', 'slippage', 'store_true', 'text', 'ts']

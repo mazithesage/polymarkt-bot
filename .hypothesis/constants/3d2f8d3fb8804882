@@ -1,0 +1,4 @@
+# file: /Users/mac/Documents/GitHub/polymarkt-bot/persistence.py
+# hypothesis_version: 6.141.1
+
+[0.0, 10.0, 3600, 5000, '.lock', 'GTC', 'PENDING', 'PLACED', 'avg_price', 'data', 'size', 'total', 'w']

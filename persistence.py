@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 BUSY_TIMEOUT_MS = 5000
 CONNECT_TIMEOUT_S = 10.0
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 # Platform-aware file locking
 try:
@@ -44,11 +44,14 @@ except ImportError:
 def init_db(db_path: str) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with _connect(db_path) as conn:
-        conn.executescript("""
+        # Use individual execute() calls instead of executescript() so that
+        # all DDL runs inside the _connect() transaction (executescript()
+        # issues an implicit COMMIT that breaks transactional guarantees).
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER NOT NULL
-            );
-
+            )""")
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 order_id TEXT UNIQUE,
@@ -62,8 +65,8 @@ def init_db(db_path: str) -> None:
                 paper_mode INTEGER DEFAULT 0,
                 created_at REAL,
                 updated_at REAL
-            );
-
+            )""")
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 condition_id TEXT,
@@ -77,16 +80,16 @@ def init_db(db_path: str) -> None:
                 opened_at REAL,
                 updated_at REAL,
                 UNIQUE(condition_id, token_id, paper_mode)
-            );
-
+            )""")
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS market_cache (
                 condition_id TEXT PRIMARY KEY,
                 question TEXT,
                 category TEXT,
                 data TEXT,
                 cached_at REAL
-            );
-
+            )""")
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS scan_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 scan_time REAL,
@@ -94,8 +97,8 @@ def init_db(db_path: str) -> None:
                 markets_with_edge INTEGER,
                 orders_placed INTEGER,
                 paper_mode INTEGER DEFAULT 0
-            );
-
+            )""")
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS redemptions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 condition_id TEXT,
@@ -104,12 +107,30 @@ def init_db(db_path: str) -> None:
                 tx_hash TEXT,
                 status TEXT,
                 created_at REAL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_orders_condition ON orders(condition_id);
-            CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
-            CREATE INDEX IF NOT EXISTS idx_positions_condition ON positions(condition_id);
-        """)
+            )""")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ob_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_time REAL,
+                condition_id TEXT,
+                token_id TEXT,
+                best_bid REAL,
+                best_ask REAL,
+                mid_price REAL,
+                spread REAL,
+                bid_depth REAL,
+                ask_depth REAL,
+                imbalance REAL,
+                estimated_prob REAL,
+                market_price REAL,
+                had_edge INTEGER DEFAULT 0,
+                paper_mode INTEGER DEFAULT 0
+            )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_condition ON orders(condition_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_condition ON positions(condition_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ob_condition ON ob_snapshots(condition_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ob_time ON ob_snapshots(snapshot_time)")
         _ensure_schema_version(conn)
 
 
@@ -122,8 +143,33 @@ def _ensure_schema_version(conn: sqlite3.Connection) -> None:
         return
     db_version = row[0]
     if db_version < CURRENT_SCHEMA_VERSION:
-        # Future migrations go here: if db_version < 2: _migrate_v1_to_v2(conn)
+        if db_version < 2:
+            _migrate_v1_to_v2(conn)
         conn.execute("UPDATE schema_version SET version = ?", (CURRENT_SCHEMA_VERSION,))
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """Add ob_snapshots table for forward-test OB logging."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ob_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_time REAL,
+            condition_id TEXT,
+            token_id TEXT,
+            best_bid REAL,
+            best_ask REAL,
+            mid_price REAL,
+            spread REAL,
+            bid_depth REAL,
+            ask_depth REAL,
+            imbalance REAL,
+            estimated_prob REAL,
+            market_price REAL,
+            had_edge INTEGER DEFAULT 0,
+            paper_mode INTEGER DEFAULT 0
+        )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ob_condition ON ob_snapshots(condition_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ob_time ON ob_snapshots(snapshot_time)")
 
 
 @contextmanager
@@ -145,7 +191,11 @@ class PersistenceStore:
         self.db_path = db_path
         self._lock_file = None
         self._acquire_lock()
-        init_db(db_path)
+        try:
+            init_db(db_path)
+        except Exception:
+            self.release_lock()
+            raise
 
     def _acquire_lock(self) -> None:
         lock_path = self.db_path + ".lock"
@@ -210,7 +260,7 @@ class PersistenceStore:
         """
         total_size = old_size + new_size
         if total_size <= 0:
-            return (total_size, new_avg)
+            return (0.0, 0.0)
         combined_avg = (old_size * old_avg + new_size * new_avg) / total_size
         return (total_size, combined_avg)
 
@@ -285,6 +335,34 @@ class PersistenceStore:
                    (scan_time, markets_found, markets_with_edge, orders_placed, paper_mode)
                    VALUES (?, ?, ?, ?, ?)""",
                 (time.time(), markets_found, markets_with_edge, orders_placed, int(paper_mode)),
+            )
+
+    def log_ob_snapshot(
+        self,
+        condition_id: str,
+        token_id: str,
+        best_bid: float,
+        best_ask: float,
+        mid_price: float,
+        spread: float,
+        bid_depth: float,
+        ask_depth: float,
+        imbalance: float,
+        estimated_prob: float,
+        market_price: float,
+        had_edge: bool = False,
+        paper_mode: bool = False,
+    ) -> None:
+        with _connect(self.db_path) as conn:
+            conn.execute(
+                """INSERT INTO ob_snapshots
+                   (snapshot_time, condition_id, token_id, best_bid, best_ask,
+                    mid_price, spread, bid_depth, ask_depth, imbalance,
+                    estimated_prob, market_price, had_edge, paper_mode)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (time.time(), condition_id, token_id, best_bid, best_ask,
+                 mid_price, spread, bid_depth, ask_depth, imbalance,
+                 estimated_prob, market_price, int(had_edge), int(paper_mode)),
             )
 
     def log_redemption(

@@ -67,6 +67,8 @@ NEG_RISK_ABI = json.loads("""[
 
 # Gas estimation is generous — 300k covers worst-case multicall
 REDEEM_GAS_LIMIT = 300_000
+# Default max gas price ceiling: 500 gwei — protects against spikes
+DEFAULT_MAX_FEE_GWEI = 500
 
 
 @dataclass
@@ -94,8 +96,37 @@ def is_condition_resolved(w3: Web3, chain_config: ChainConfig, condition_id: str
         denominator = ct.functions.payoutDenominator(condition_bytes).call()
         return denominator > 0
     except Exception as e:
-        logger.warning(f"Error checking condition resolution: {e}")
+        logger.warning("Error checking condition resolution: %s", e)
         return False
+
+
+def _eip1559_gas_params(w3: Web3, max_fee_gwei: int = DEFAULT_MAX_FEE_GWEI) -> dict:
+    """Build EIP-1559 gas parameters with a ceiling.
+
+    Uses the node's suggested priority fee and latest base fee to compute
+    maxFeePerGas, capped at max_fee_gwei to protect against spikes.
+    """
+    max_fee_wei = w3.to_wei(max_fee_gwei, "gwei")
+    try:
+        priority_fee = w3.eth.max_priority_fee_per_gas
+    except AttributeError:
+        # Fallback for older web3 versions
+        priority_fee = w3.to_wei(30, "gwei")
+
+    latest = w3.eth.get_block("latest")
+    base_fee = latest.get("baseFeePerGas", 0)
+
+    # maxFeePerGas = 2 * baseFee + priorityFee, capped at ceiling
+    suggested = 2 * base_fee + priority_fee
+    max_fee = min(suggested, max_fee_wei)
+
+    # Priority fee must not exceed max fee
+    priority_fee = min(priority_fee, max_fee)
+
+    return {
+        "maxFeePerGas": max_fee,
+        "maxPriorityFeePerGas": priority_fee,
+    }
 
 
 def redeem_positions(
@@ -104,6 +135,7 @@ def redeem_positions(
     condition_id: str,
     index_sets: Optional[List[int]] = None,
     neg_risk: bool = False,
+    max_fee_gwei: int = DEFAULT_MAX_FEE_GWEI,
 ) -> RedemptionResult:
     if index_sets is None:
         index_sets = [1, 2]  # binary market default
@@ -111,6 +143,7 @@ def redeem_positions(
     condition_bytes = bytes.fromhex(condition_id.replace("0x", ""))
     account = w3.eth.account.from_key(chain_config.private_key)
     sender = chain_config.proxy_address or account.address
+    gas_params = _eip1559_gas_params(w3, max_fee_gwei)
 
     if neg_risk:
         contract = w3.eth.contract(
@@ -123,7 +156,7 @@ def redeem_positions(
             "from": Web3.to_checksum_address(sender),
             "nonce": w3.eth.get_transaction_count(Web3.to_checksum_address(sender)),
             "gas": REDEEM_GAS_LIMIT,
-            "gasPrice": w3.eth.gas_price,
+            **gas_params,
         })
     else:
         contract = w3.eth.contract(
@@ -140,7 +173,7 @@ def redeem_positions(
             "from": Web3.to_checksum_address(sender),
             "nonce": w3.eth.get_transaction_count(Web3.to_checksum_address(sender)),
             "gas": REDEEM_GAS_LIMIT,
-            "gasPrice": w3.eth.gas_price,
+            **gas_params,
         })
 
     signed = w3.eth.account.sign_transaction(tx, chain_config.private_key)

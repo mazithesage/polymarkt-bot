@@ -1,0 +1,4 @@
+# file: /Users/mac/Documents/GitHub/polymarkt-bot/config.py
+# hypothesis_version: 6.141.1
+
+[0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.7, 0.99, 10.0, 30.0, 100.0, 5000.0, 137, 300, '0.01', '0.02', '0.05', '0.10', '0.25', '0.70', '0.99', '1', '10', '10.0', '100.0', '3', '30.0', '300', '5', '50', '5000.0', '60', 'BANKROLL_MULTIPLIER', 'CHAIN_ID', 'DB_PATH', 'GTC', 'HTTP_MAX_RETRIES', 'HTTP_TIMEOUT', 'INFO', 'KELLY_FRACTION', 'LOG_FORMAT', 'LOG_LEVEL', 'MAX_MARKETS', 'MAX_POSITION_USDC', 'MAX_SPREAD', 'MAX_TRADEABLE_PRICE', 'MIN_EDGE', 'MIN_LIQUIDITY', 'MIN_TRADEABLE_PRICE', 'OB_IMBALANCE_WEIGHT', 'PAPER_MODE', 'POLYGON_RPC_URL', 'POLYMARKET_API_KEY', 'PRIVATE_KEY', 'PROXY_ADDRESS', 'SLIPPAGE_IMPACT_BPS', 'SLIPPAGE_SPREAD_BPS', 'SSVI_R2_THRESHOLD', 'data/bot.db', 'json', 'on', 'text', 'true', 'yes']

@@ -1,0 +1,4 @@
+# file: /Users/mac/Documents/GitHub/polymarkt-bot/clob_client.py
+# hypothesis_version: 6.141.1
+
+[0.0, 1.0, 1000, '/order', '/orders', '0', '1', 'BUY', 'Content-Type', 'DELETE', 'EIP712Domain', 'FOK', 'GET', 'GTC', 'GTD', 'Order', 'POLY_API_KEY', 'POLY_PASSPHRASE', 'POLY_SIGNATURE', 'POLY_TIMESTAMP', 'POST', 'SELL', 'UNKNOWN', 'address', 'application/json', 'asks', 'bids', 'chainId', 'domain', 'expiration', 'feeRateBps', 'maker', 'makerAmount', 'message', 'name', 'nonce', 'order', 'orderID', 'orderType', 'polymarket-bot', 'price', 'primaryType', 'salt', 'side', 'signature', 'signatureType', 'signer', 'size', 'status', 'string', 'taker', 'takerAmount', 'tokenID', 'tokenId', 'type', 'types', 'uint256', 'uint8', 'verifyingContract', 'version']

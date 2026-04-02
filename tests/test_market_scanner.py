@@ -286,3 +286,82 @@ class TestMarketScannerPagination:
             markets = await scanner.fetch_active_markets(limit=10000)
             await scanner.close()
         assert len(markets) <= 100  # max_pages=20, 5/page
+
+
+# --- closed field default ---
+
+class TestClosedFieldDefault:
+    def test_missing_closed_field_defaults_to_active(self):
+        """If 'closed' field is missing, market should be active (not closed)."""
+        raw = {
+            "condition_id": "0xmissing",
+            "question": "Test market",
+            "description": "",
+            "tokens": [{"token_id": "t1", "outcome": "Yes"}],
+            "end_date_iso": "2025-12-31",
+            "active": True,
+            # 'closed' deliberately omitted
+            "volume": 1000, "liquidity": 500, "neg_risk": False,
+        }
+        market = _parse_market(raw)
+        assert market.active is True
+
+    def test_closed_true_marks_inactive(self):
+        raw = {
+            "condition_id": "0xclosed",
+            "question": "Closed market",
+            "description": "",
+            "tokens": [],
+            "end_date_iso": "",
+            "active": True, "closed": True,
+            "volume": 0, "liquidity": 0, "neg_risk": False,
+        }
+        assert _parse_market(raw).active is False
+
+    def test_closed_false_stays_active(self):
+        raw = {
+            "condition_id": "0xopen",
+            "question": "Open market",
+            "description": "",
+            "tokens": [{"token_id": "t1", "outcome": "Yes"}],
+            "end_date_iso": "",
+            "active": True, "closed": False,
+            "volume": 0, "liquidity": 0, "neg_risk": False,
+        }
+        assert _parse_market(raw).active is True
+
+
+# --- fetch_market_by_condition ---
+
+MARKET_BY_ID_PATTERN = re.compile(r"^https://gamma-api\.polymarket\.com/markets/")
+
+
+@pytest.mark.asyncio
+class TestFetchMarketByCondition:
+    async def test_returns_market_on_200(self):
+        scanner = _make_scanner()
+        raw = {
+            "condition_id": "0xabc",
+            "question": "Will BTC hit 100k?",
+            "description": "",
+            "tokens": [{"token_id": "t1", "outcome": "Yes"}],
+            "end_date_iso": "2025-12-31",
+            "active": True, "closed": False,
+            "volume": 5000, "liquidity": 2000, "neg_risk": False,
+        }
+        with aioresponses() as m, patch("retry.asyncio.sleep", side_effect=_noop_sleep):
+            m.get(MARKET_BY_ID_PATTERN, payload=raw)
+            scanner._session = aiohttp.ClientSession()
+            market = await scanner.fetch_market_by_condition("0xabc")
+            await scanner.close()
+        assert market is not None
+        assert market.condition_id == "0xabc"
+
+    async def test_returns_none_on_404(self):
+        scanner = _make_scanner()
+        with aioresponses() as m, patch("retry.asyncio.sleep", side_effect=_noop_sleep):
+            m.get(MARKET_BY_ID_PATTERN, status=404)
+            scanner._session = aiohttp.ClientSession()
+            market = await scanner.fetch_market_by_condition("0xnotfound")
+            await scanner.close()
+        assert market is None

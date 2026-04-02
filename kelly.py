@@ -15,7 +15,7 @@ class KellyResult:
     kelly_fraction: float
     position_size: float
     confidence: float
-    side: str       # "BUY" or "SELL"
+    side: str       # Always "BUY" — we buy YES or NO tokens, never sell
     token_choice: str  # "YES" or "NO"
 
 

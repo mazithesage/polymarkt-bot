@@ -157,7 +157,7 @@ def _parse_market(raw: dict) -> Market:
         category=classify_market(question, description),
         tokens=tokens,
         end_date=end_date,
-        active=raw.get("active", False) and not raw.get("closed", True),
+        active=raw.get("active", False) and not raw.get("closed", False),
         volume=float(raw.get("volume", 0)),
         liquidity=float(raw.get("liquidity", 0)),
         neg_risk=neg_risk_val,
@@ -211,13 +211,14 @@ class MarketScanner:
                         session, "GET", f"{self.gamma_url}/markets", params=params,
                     )
                     if resp.status != 200:
-                        logger.warning(f"Market fetch returned {resp.status} on page {page}")
+                        logger.warning("Market fetch returned %d on page %d", resp.status, page)
                         break
                     data = await resp.json()
             except Exception as e:
                 logger.warning(
-                    f"Pagination failed on page {page}: {e}, "
-                    f"returning {len(all_markets)} markets collected so far"
+                    "Pagination failed on page %d: %s, "
+                    "returning %d markets collected so far",
+                    page, e, len(all_markets),
                 )
                 break
 
@@ -227,8 +228,8 @@ class MarketScanner:
             page_markets = [_parse_market(m) for m in data]
             all_markets.extend(page_markets)
             logger.debug(
-                f"Page {page}: fetched {len(page_markets)} markets "
-                f"(total: {len(all_markets)})"
+                "Page %d: fetched %d markets (total: %d)",
+                page, len(page_markets), len(all_markets),
             )
 
             if len(data) < fetch_size:
@@ -241,10 +242,17 @@ class MarketScanner:
 
     async def fetch_market_by_condition(self, condition_id: str) -> Optional[Market]:
         session = await self._get_session()
-        async with session.get(f"{self.gamma_url}/markets/{condition_id}") as resp:
+        async with self._semaphore:
+            resp = await retry_request(
+                session, "GET", f"{self.gamma_url}/markets/{condition_id}",
+            )
             if resp.status != 200:
+                resp.release()
                 return None
-            data = await resp.json()
+            try:
+                data = await resp.json()
+            finally:
+                resp.release()
             return _parse_market(data)
 
     async def scan_and_classify(

@@ -19,6 +19,7 @@ class TestInitDB:
         assert "scan_log" in table_names
         assert "redemptions" in table_names
         assert "schema_version" in table_names
+        assert "ob_snapshots" in table_names
         conn.close()
 
     def test_idempotent_init(self, db_path):
@@ -170,6 +171,32 @@ class TestVWAPPositionAccumulation:
         assert len(positions) == 2
 
 
+class TestVWAPEdgeCases:
+    """Edge cases for _compute_vwap static method."""
+
+    def test_zero_total_size_returns_zero_avg(self):
+        """When position fully closed (total_size=0), avg should be 0.0."""
+        total, avg = PersistenceStore._compute_vwap(10.0, 0.50, -10.0, 0.60)
+        assert total == 0.0
+        assert avg == 0.0
+
+    def test_negative_total_size_returns_zero(self):
+        """Oversell (total_size < 0) should return (0.0, 0.0)."""
+        total, avg = PersistenceStore._compute_vwap(5.0, 0.50, -10.0, 0.60)
+        assert total == 0.0
+        assert avg == 0.0
+
+    def test_normal_accumulation(self):
+        total, avg = PersistenceStore._compute_vwap(10.0, 0.50, 10.0, 0.60)
+        assert total == 20.0
+        assert avg == pytest.approx(0.55)
+
+    def test_first_fill(self):
+        total, avg = PersistenceStore._compute_vwap(0.0, 0.0, 10.0, 0.55)
+        assert total == 10.0
+        assert avg == pytest.approx(0.55)
+
+
 class TestScanLog:
     def test_log_scan(self, db_path):
         store = PersistenceStore(db_path)
@@ -206,4 +233,177 @@ class TestRedemptionLog:
         rows = conn.execute("SELECT * FROM redemptions").fetchall()
         assert len(rows) == 1
         assert dict(rows[0])["tx_hash"] == "0xabc123"
+        conn.close()
+
+
+class TestOBSnapshots:
+    def test_log_and_read_snapshot(self, db_path):
+        store = PersistenceStore(db_path)
+        store.log_ob_snapshot(
+            condition_id="cond-1", token_id="tok-1",
+            best_bid=0.48, best_ask=0.52, mid_price=0.50,
+            spread=0.04, bid_depth=1000.0, ask_depth=800.0,
+            imbalance=0.111, estimated_prob=0.506,
+            market_price=0.50, had_edge=True, paper_mode=True,
+        )
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM ob_snapshots").fetchall()
+        conn.close()
+        store.release_lock()
+        assert len(rows) == 1
+        row = dict(rows[0])
+        assert row["condition_id"] == "cond-1"
+        assert row["token_id"] == "tok-1"
+        assert row["best_bid"] == pytest.approx(0.48)
+        assert row["best_ask"] == pytest.approx(0.52)
+        assert row["mid_price"] == pytest.approx(0.50)
+        assert row["imbalance"] == pytest.approx(0.111)
+        assert row["estimated_prob"] == pytest.approx(0.506)
+        assert row["had_edge"] == 1
+        assert row["paper_mode"] == 1
+        assert row["snapshot_time"] > 0
+
+    def test_multiple_snapshots(self, db_path):
+        store = PersistenceStore(db_path)
+        for i in range(5):
+            store.log_ob_snapshot(
+                condition_id=f"cond-{i}", token_id=f"tok-{i}",
+                best_bid=0.45, best_ask=0.55, mid_price=0.50,
+                spread=0.10, bid_depth=500.0, ask_depth=500.0,
+                imbalance=0.0, estimated_prob=0.50,
+                market_price=0.50,
+            )
+        conn = sqlite3.connect(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM ob_snapshots").fetchone()[0]
+        conn.close()
+        store.release_lock()
+        assert count == 5
+
+    def test_indexes_exist(self, db_path):
+        store = PersistenceStore(db_path)
+        conn = sqlite3.connect(db_path)
+        indexes = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+        index_names = {idx[0] for idx in indexes}
+        conn.close()
+        store.release_lock()
+        assert "idx_ob_condition" in index_names
+        assert "idx_ob_time" in index_names
+
+
+class TestSchemaMigrationV1ToV2:
+    def _create_v1_database(self, db_path):
+        """Create a v1 database without ob_snapshots table."""
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (1);
+
+            CREATE TABLE orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT UNIQUE,
+                condition_id TEXT,
+                token_id TEXT,
+                side TEXT,
+                price REAL,
+                size REAL,
+                order_type TEXT,
+                status TEXT,
+                paper_mode INTEGER DEFAULT 0,
+                created_at REAL,
+                updated_at REAL
+            );
+
+            CREATE TABLE positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                condition_id TEXT,
+                token_id TEXT,
+                token_choice TEXT,
+                size REAL,
+                avg_price REAL,
+                current_price REAL,
+                pnl REAL DEFAULT 0.0,
+                paper_mode INTEGER DEFAULT 0,
+                opened_at REAL,
+                updated_at REAL,
+                UNIQUE(condition_id, token_id, paper_mode)
+            );
+
+            CREATE TABLE market_cache (
+                condition_id TEXT PRIMARY KEY,
+                question TEXT,
+                category TEXT,
+                data TEXT,
+                cached_at REAL
+            );
+
+            CREATE TABLE scan_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_time REAL,
+                markets_found INTEGER,
+                markets_with_edge INTEGER,
+                orders_placed INTEGER,
+                paper_mode INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE redemptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                condition_id TEXT,
+                token_id TEXT,
+                amount REAL,
+                tx_hash TEXT,
+                status TEXT,
+                created_at REAL
+            );
+
+            CREATE INDEX idx_orders_condition ON orders(condition_id);
+            CREATE INDEX idx_orders_status ON orders(status);
+            CREATE INDEX idx_positions_condition ON positions(condition_id);
+        """)
+        conn.close()
+
+    def test_migration_creates_ob_snapshots(self, db_path):
+        self._create_v1_database(db_path)
+        # Verify ob_snapshots does NOT exist yet
+        conn = sqlite3.connect(db_path)
+        tables = {t[0] for t in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        assert "ob_snapshots" not in tables
+        conn.close()
+
+        # Run init_db which should trigger v1→v2 migration
+        init_db(db_path)
+
+        conn = sqlite3.connect(db_path)
+        tables = {t[0] for t in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        assert "ob_snapshots" in tables
+        version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        assert version == 2
+        conn.close()
+
+    def test_migration_preserves_existing_data(self, db_path):
+        self._create_v1_database(db_path)
+        # Insert some v1 data
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO orders (order_id, condition_id, token_id, side, price, size) "
+            "VALUES ('o1', 'c1', 't1', 'BUY', 0.5, 10.0)"
+        )
+        conn.commit()
+        conn.close()
+
+        # Migrate
+        init_db(db_path)
+
+        # Verify old data still exists
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        orders = conn.execute("SELECT * FROM orders").fetchall()
+        assert len(orders) == 1
+        assert dict(orders[0])["order_id"] == "o1"
         conn.close()

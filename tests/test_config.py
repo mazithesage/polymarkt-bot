@@ -1,5 +1,8 @@
+import os
+from unittest.mock import patch
+
 import pytest
-from config import BotConfig, ChainConfig, ClobConfig, validate_live_config
+from config import BotConfig, ChainConfig, ClobConfig, load_config, validate_live_config
 
 
 class TestBotConfigValidation:
@@ -146,3 +149,23 @@ class TestValidateLiveConfig:
         chain = ChainConfig(private_key="0xdeadbeef")
         with pytest.raises(ValueError, match="API_KEY"):
             validate_live_config(clob, chain, BotConfig(paper_mode=False))
+
+
+class TestPaperModeParsing:
+    """Verify PAPER_MODE env var accepts various truthy/falsy values."""
+
+    @pytest.mark.parametrize("value,expected", [
+        ("true", True), ("True", True), ("TRUE", True),
+        ("1", True), ("yes", True), ("on", True),
+        ("false", False), ("False", False), ("0", False),
+        ("no", False), ("off", False), ("anything", False),
+    ])
+    def test_paper_mode_truthy_values(self, value, expected):
+        env = {
+            "PAPER_MODE": value,
+            "POLYMARKET_API_KEY": "", "POLYMARKET_API_SECRET": "",
+            "POLYMARKET_API_PASSPHRASE": "",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            _, _, bot = load_config()
+        assert bot.paper_mode is expected

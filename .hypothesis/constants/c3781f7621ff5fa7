@@ -1,0 +1,4 @@
+# file: /Users/mac/Documents/GitHub/polymarkt-bot/retry.py
+# hypothesis_version: 6.141.1
+
+[0.5, 429, 500, 502, 503, 504, 'Retry-After', 'polymarket-bot']

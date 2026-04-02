@@ -130,6 +130,12 @@ def _price_to_amounts(price: float, size: float, side: Side) -> Tuple[int, int]:
     return maker_amount, taker_amount
 
 
+def _warn_non_numeric_token(token_id: str) -> int:
+    """Log a warning and return 0 for non-numeric token IDs."""
+    logger.warning("Non-numeric token_id %r — using tokenId=0 in EIP-712 message", token_id)
+    return 0
+
+
 def build_order_message(
     order: Order,
     maker: str,
@@ -146,7 +152,7 @@ def build_order_message(
         "maker": maker,
         "signer": signer,
         "taker": "0x0000000000000000000000000000000000000000",
-        "tokenId": int(order.token_id) if order.token_id.isdigit() else 0,
+        "tokenId": int(order.token_id) if order.token_id.isdigit() else _warn_non_numeric_token(order.token_id),
         "makerAmount": maker_amount,
         "takerAmount": taker_amount,
         "expiration": order.expiration,
@@ -230,7 +236,10 @@ class ClobClient:
         headers = self._auth_headers("GET", path)
         async with self._semaphore:
             resp = await retry_request(session, "GET", f"{self.base_url}{path}", headers=headers)
-            data = await resp.json()
+            try:
+                data = await resp.json()
+            finally:
+                resp.release()
 
         bids = data.get("bids", []) or []
         asks = data.get("asks", []) or []
@@ -248,10 +257,15 @@ class ClobClient:
         best_bid = float(valid_bids[0]["price"]) if valid_bids else 0.0
         best_ask = float(valid_asks[0]["price"]) if valid_asks else 1.0
 
-        # Crossed book: bid >= ask means one side is stale.
-        # Conservatively use best_ask as mid and zero-out spread to signal
-        # unreliable book — downstream checks on spread will skip this market.
-        if best_bid >= best_ask and valid_bids and valid_asks:
+        if not valid_bids and not valid_asks:
+            # Completely empty book — signal invalid with mid=0 so
+            # downstream min_tradeable_price filter rejects it.
+            mid = 0.0
+            spread = 0.0
+        elif best_bid >= best_ask and valid_bids and valid_asks:
+            # Crossed book: bid >= ask means one side is stale.
+            # Conservatively use best_ask as mid and zero-out spread to signal
+            # unreliable book — downstream checks on spread will skip this market.
             logger.warning(
                 "Crossed book for %s: bid=%.4f >= ask=%.4f, treating as unreliable",
                 token_id, best_bid, best_ask,
@@ -306,7 +320,10 @@ class ClobClient:
                 session, "POST", f"{self.base_url}{path}",
                 headers=headers, data=body,
             )
-            data = await resp.json()
+            try:
+                data = await resp.json()
+            finally:
+                resp.release()
 
         return OrderResult(
             order_id=data.get("orderID", ""),
@@ -324,11 +341,18 @@ class ClobClient:
         headers = self._auth_headers("DELETE", path)
         async with self._semaphore:
             resp = await retry_request(session, "DELETE", f"{self.base_url}{path}", headers=headers)
-            return await resp.json()
+            try:
+                return await resp.json()
+            finally:
+                resp.release()
 
     async def get_open_orders(self) -> List[Dict]:
         session = await self._get_session()
         path = "/orders"
         headers = self._auth_headers("GET", path)
-        async with session.get(f"{self.base_url}{path}", headers=headers) as resp:
-            return await resp.json()
+        async with self._semaphore:
+            resp = await retry_request(session, "GET", f"{self.base_url}{path}", headers=headers)
+            try:
+                return await resp.json()
+            finally:
+                resp.release()
