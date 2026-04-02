@@ -1,6 +1,7 @@
 """Market discovery and classification via the Gamma API."""
 
 import asyncio
+import json
 import logging
 import math
 import re
@@ -145,25 +146,48 @@ def classify_market(question: str, description: str = "") -> MarketCategory:
 
 
 def _parse_market(raw: dict) -> Market:
+    # Build tokens list — handle both nested array and JSON-string formats.
     tokens = []
-    for t in raw.get("tokens", []):
-        tokens.append({
-            "token_id": t.get("token_id", ""),
-            "outcome": t.get("outcome", ""),
-        })
+    raw_tokens = raw.get("tokens", [])
+    if raw_tokens:
+        # Individual market endpoint format: tokens is a list of dicts
+        for t in raw_tokens:
+            tokens.append({
+                "token_id": t.get("token_id", ""),
+                "outcome": t.get("outcome", ""),
+            })
+    else:
+        # List endpoint format: clobTokenIds + outcomes as JSON strings
+        try:
+            token_ids = json.loads(raw.get("clobTokenIds", "[]"))
+            outcomes = json.loads(raw.get("outcomes", "[]"))
+            for tid, outcome in zip(token_ids, outcomes):
+                tokens.append({"token_id": tid, "outcome": outcome})
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     question = raw.get("question", "")
     description = raw.get("description", "")
+
+    # Support both camelCase (Gamma API) and snake_case field names.
+    condition_id = raw.get("conditionId") or raw.get("condition_id", "")
+    end_date = raw.get("endDateIso") or raw.get("end_date_iso", "")
+
+    neg_risk_val = raw.get("negRisk")
+    if neg_risk_val is None:
+        neg_risk_val = raw.get("neg_risk", False)
+
     return Market(
-        condition_id=raw.get("condition_id", ""),
+        condition_id=condition_id,
         question=question,
         description=description,
         category=classify_market(question, description),
         tokens=tokens,
-        end_date=raw.get("end_date_iso", ""),
+        end_date=end_date,
         active=raw.get("active", False) and not raw.get("closed", True),
         volume=float(raw.get("volume", 0)),
         liquidity=float(raw.get("liquidity", 0)),
-        neg_risk=raw.get("neg_risk", False),
+        neg_risk=neg_risk_val,
     )
 
 

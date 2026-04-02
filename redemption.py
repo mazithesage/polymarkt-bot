@@ -10,7 +10,7 @@ from web3.middleware import ExtraDataToPOAMiddleware
 
 from config import ChainConfig, USDC_DECIMALS
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("polymarket-bot")
 
 # ERC-20 Transfer(address,address,uint256) event signature
 _TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)").hex()

@@ -200,6 +200,20 @@ class PersistenceStore:
                 (status, time.time(), order_id),
             )
 
+    @staticmethod
+    def _compute_vwap(
+        old_size: float, old_avg: float, new_size: float, new_avg: float,
+    ) -> tuple[float, float]:
+        """Compute VWAP after adding a new fill to an existing position.
+
+        Returns (combined_size, combined_avg_price).
+        """
+        total_size = old_size + new_size
+        if total_size <= 0:
+            return (total_size, new_avg)
+        combined_avg = (old_size * old_avg + new_size * new_avg) / total_size
+        return (total_size, combined_avg)
+
     def upsert_position(
         self,
         condition_id: str,
@@ -212,41 +226,34 @@ class PersistenceStore:
     ) -> None:
         now = time.time()
         with _connect(self.db_path) as conn:
-            conn.execute(
-                """INSERT INTO positions
-                   (condition_id, token_id, token_choice, size, avg_price,
-                    current_price, pnl, paper_mode, opened_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(condition_id, token_id, paper_mode)
-                   DO UPDATE SET
-                     size = positions.size + excluded.size,
-                     avg_price = CASE
-                       WHEN (positions.size + excluded.size) > 0
-                       THEN (positions.size * positions.avg_price
-                             + excluded.size * excluded.avg_price)
-                            / (positions.size + excluded.size)
-                       ELSE excluded.avg_price
-                     END,
-                     current_price = excluded.current_price,
-                     pnl = CASE
-                       WHEN excluded.current_price > 0
-                       THEN (excluded.current_price
-                             - CASE
-                                 WHEN (positions.size + excluded.size) > 0
-                                 THEN (positions.size * positions.avg_price
-                                       + excluded.size * excluded.avg_price)
-                                      / (positions.size + excluded.size)
-                                 ELSE excluded.avg_price
-                               END)
-                            * (positions.size + excluded.size)
-                       ELSE 0.0
-                     END,
-                     updated_at = excluded.updated_at""",
-                (condition_id, token_id, token_choice, size, avg_price,
-                 current_price,
-                 (current_price - avg_price) * size if current_price > 0 else 0.0,
-                 int(paper_mode), now, now),
-            )
+            row = conn.execute(
+                "SELECT size, avg_price FROM positions "
+                "WHERE condition_id=? AND token_id=? AND paper_mode=?",
+                (condition_id, token_id, int(paper_mode)),
+            ).fetchone()
+
+            if row is None:
+                pnl = (current_price - avg_price) * size if current_price > 0 else 0.0
+                conn.execute(
+                    """INSERT INTO positions
+                       (condition_id, token_id, token_choice, size, avg_price,
+                        current_price, pnl, paper_mode, opened_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (condition_id, token_id, token_choice, size, avg_price,
+                     current_price, pnl, int(paper_mode), now, now),
+                )
+            else:
+                total_size, vwap = self._compute_vwap(
+                    row["size"], row["avg_price"], size, avg_price,
+                )
+                pnl = (current_price - vwap) * total_size if current_price > 0 else 0.0
+                conn.execute(
+                    """UPDATE positions
+                       SET size=?, avg_price=?, current_price=?, pnl=?, updated_at=?
+                       WHERE condition_id=? AND token_id=? AND paper_mode=?""",
+                    (total_size, vwap, current_price, pnl, now,
+                     condition_id, token_id, int(paper_mode)),
+                )
 
     def get_open_positions(self, paper_mode: bool = False) -> List[Dict]:
         with _connect(self.db_path) as conn:

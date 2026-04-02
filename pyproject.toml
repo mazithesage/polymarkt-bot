@@ -22,6 +22,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "aioresponses>=0.7.6",
     "ruff>=0.3",
+    "mypy>=1.8",
 ]
 
 [tool.pytest.ini_options]
@@ -30,6 +31,21 @@ testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "aioresponses.*",
+    "eth_account.*",
+    "web3.*",
+]
+ignore_missing_imports = true
 
 [tool.ruff]
 target-version = "py311"

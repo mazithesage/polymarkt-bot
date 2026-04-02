@@ -103,6 +103,30 @@ class TestBotConfigValidation:
         with pytest.raises(ValueError, match="bankroll_multiplier"):
             BotConfig(bankroll_multiplier=0.0)
 
+    def test_ob_imbalance_weight_default(self):
+        cfg = BotConfig()
+        assert cfg.ob_imbalance_weight == 0.05
+
+    def test_ob_imbalance_weight_zero_rejected(self):
+        with pytest.raises(ValueError, match="ob_imbalance_weight"):
+            BotConfig(ob_imbalance_weight=0.0)
+
+    def test_ob_imbalance_weight_negative_rejected(self):
+        with pytest.raises(ValueError, match="ob_imbalance_weight"):
+            BotConfig(ob_imbalance_weight=-0.01)
+
+    def test_ob_imbalance_weight_above_max_rejected(self):
+        with pytest.raises(ValueError, match="ob_imbalance_weight"):
+            BotConfig(ob_imbalance_weight=0.25)
+
+    def test_ob_imbalance_weight_custom_value(self):
+        cfg = BotConfig(ob_imbalance_weight=0.10)
+        assert cfg.ob_imbalance_weight == 0.10
+
+    def test_ob_imbalance_weight_at_max_allowed(self):
+        cfg = BotConfig(ob_imbalance_weight=0.20)
+        assert cfg.ob_imbalance_weight == 0.20
+
 
 class TestValidateLiveConfig:
     def test_paper_mode_always_passes(self):

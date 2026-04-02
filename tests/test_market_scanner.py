@@ -136,6 +136,56 @@ class TestParseMarket:
         assert market.neg_risk is True
         assert market.category == MarketCategory.POLITICS
 
+    def test_parse_camelcase_gamma_response(self):
+        """Gamma list endpoint returns camelCase fields with JSON-string tokens."""
+        raw = {
+            "conditionId": "0xcamel",
+            "question": "Will BTC hit 100k?",
+            "description": "Bitcoin price market",
+            "clobTokenIds": '["tok-yes-1", "tok-no-1"]',
+            "outcomes": '["Yes", "No"]',
+            "endDateIso": "2025-12-31",
+            "active": True, "closed": False,
+            "volume": 75000.0, "liquidity": 20000.0, "negRisk": True,
+        }
+        market = _parse_market(raw)
+        assert market.condition_id == "0xcamel"
+        assert market.end_date == "2025-12-31"
+        assert market.neg_risk is True
+        assert market.yes_token_id == "tok-yes-1"
+        assert market.no_token_id == "tok-no-1"
+        assert market.category == MarketCategory.CRYPTO
+
+    def test_parse_camelcase_neg_risk_false(self):
+        """negRisk=False must not fall through to snake_case fallback."""
+        raw = {
+            "conditionId": "0xbool",
+            "question": "Test",
+            "description": "",
+            "clobTokenIds": '["t1"]',
+            "outcomes": '["Yes"]',
+            "endDateIso": "",
+            "active": True, "closed": False,
+            "volume": 0, "liquidity": 0, "negRisk": False,
+        }
+        assert _parse_market(raw).neg_risk is False
+
+    def test_parse_malformed_clob_token_ids(self):
+        """Malformed clobTokenIds JSON should result in empty tokens."""
+        raw = {
+            "conditionId": "0xbad",
+            "question": "Test",
+            "description": "",
+            "clobTokenIds": "not-valid-json",
+            "outcomes": '["Yes"]',
+            "endDateIso": "",
+            "active": True, "closed": False,
+            "volume": 0, "liquidity": 0, "negRisk": False,
+        }
+        market = _parse_market(raw)
+        assert market.tokens == []
+        assert market.yes_token_id == ""
+
 
 # --- market properties ---
 

@@ -239,31 +239,189 @@ class TestSSVIR2Rejection:
         return PolymarketBot(clob, chain, bot_cfg)
 
     @pytest.mark.asyncio
-    async def test_low_r2_falls_back_to_mid_price(self, paper_bot):
+    async def test_non_crypto_uses_ob_imbalance(self, paper_bot):
+        """Non-crypto markets should use OB imbalance, not SSVI."""
         market = Market(
-            condition_id="c1", question="Test crypto", description="",
+            condition_id="c1", question="Test non-crypto", description="",
             category=MarketCategory.OTHER,
             tokens=[{"token_id": "t1", "outcome": "Yes"}],
             end_date="", active=True, volume=1000, liquidity=500, neg_risk=False,
         )
-        low_r2_params = SSVIParams(theta=0.1, rho=0.0, phi=1.0, r_squared=0.30)
-        with patch("bot.fit_ssvi", return_value=low_r2_params):
-            prob = await paper_bot._estimate_probability(market, 0.55)
-            await paper_bot.close()
-        assert prob == 0.55
+        book = OrderBookSummary(
+            token_id="t1", best_bid=0.50, best_ask=0.60,
+            mid_price=0.55, spread=0.10, bid_depth=150, ask_depth=50,
+        )
+        prob = await paper_bot._estimate_probability(market, book)
+        await paper_bot.close()
+        # bid-heavy book → prob should be above mid_price
+        assert prob > 0.55
 
     @pytest.mark.asyncio
-    async def test_high_r2_uses_ssvi_probability(self, paper_bot):
+    async def test_ob_imbalance_returns_valid_probability(self, paper_bot):
         market = Market(
             condition_id="c1", question="Test", description="",
             category=MarketCategory.OTHER,
             tokens=[{"token_id": "t1", "outcome": "Yes"}],
             end_date="", active=True, volume=1000, liquidity=500, neg_risk=False,
         )
-        prob = await paper_bot._estimate_probability(market, 0.55)
+        book = OrderBookSummary(
+            token_id="t1", best_bid=0.50, best_ask=0.60,
+            mid_price=0.55, spread=0.10, bid_depth=100, ask_depth=100,
+        )
+        prob = await paper_bot._estimate_probability(market, book)
         await paper_bot.close()
         assert isinstance(prob, float)
         assert 0 < prob < 1
+
+
+class TestOrderBookImbalanceProbability:
+    """Verify the OB imbalance probability model directly."""
+
+    @pytest.fixture
+    def paper_bot(self, tmp_path):
+        clob = ClobConfig(api_key="test", api_secret="test", api_passphrase="test")
+        chain = ChainConfig(
+            private_key="ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        bot_cfg = BotConfig(
+            paper_mode=True,
+            db_path=str(tmp_path / "ob_test.db"),
+            ob_imbalance_weight=0.05,
+        )
+        return PolymarketBot(clob, chain, bot_cfg)
+
+    def test_balanced_book_returns_mid(self, paper_bot):
+        book = OrderBookSummary(
+            token_id="t1", best_bid=0.50, best_ask=0.60,
+            mid_price=0.55, spread=0.10, bid_depth=100, ask_depth=100,
+        )
+        prob = paper_bot._ob_imbalance_probability(book)
+        assert prob == pytest.approx(0.55)
+
+    def test_bid_heavy_raises_probability(self, paper_bot):
+        book = OrderBookSummary(
+            token_id="t1", best_bid=0.50, best_ask=0.60,
+            mid_price=0.55, spread=0.10, bid_depth=200, ask_depth=50,
+        )
+        prob = paper_bot._ob_imbalance_probability(book)
+        # imbalance = (200-50)/(200+50) = 0.6, adjustment = 0.6*0.05 = 0.03
+        assert prob > 0.55
+        assert prob == pytest.approx(0.55 + 0.6 * 0.05, abs=0.001)
+
+    def test_ask_heavy_lowers_probability(self, paper_bot):
+        book = OrderBookSummary(
+            token_id="t1", best_bid=0.50, best_ask=0.60,
+            mid_price=0.55, spread=0.10, bid_depth=50, ask_depth=200,
+        )
+        prob = paper_bot._ob_imbalance_probability(book)
+        # imbalance = (50-200)/(50+200) = -0.6, adjustment = -0.6*0.05 = -0.03
+        assert prob < 0.55
+        assert prob == pytest.approx(0.55 - 0.6 * 0.05, abs=0.001)
+
+    def test_zero_total_depth_returns_mid(self, paper_bot):
+        book = OrderBookSummary(
+            token_id="t1", best_bid=0.50, best_ask=0.60,
+            mid_price=0.55, spread=0.10, bid_depth=0, ask_depth=0,
+        )
+        prob = paper_bot._ob_imbalance_probability(book)
+        assert prob == 0.55
+
+    def test_one_side_zero_max_imbalance(self, paper_bot):
+        book = OrderBookSummary(
+            token_id="t1", best_bid=0.50, best_ask=0.60,
+            mid_price=0.55, spread=0.10, bid_depth=100, ask_depth=0,
+        )
+        prob = paper_bot._ob_imbalance_probability(book)
+        # imbalance = 1.0, adjustment = 0.05
+        assert prob == pytest.approx(0.60, abs=0.001)
+
+    def test_clamping_high(self, paper_bot):
+        book = OrderBookSummary(
+            token_id="t1", best_bid=0.97, best_ask=0.99,
+            mid_price=0.98, spread=0.02, bid_depth=1000, ask_depth=0,
+        )
+        prob = paper_bot._ob_imbalance_probability(book)
+        # Would be 0.98 + 0.05 = 1.03, clamped to 0.99
+        assert prob == 0.99
+
+    def test_clamping_low(self, paper_bot):
+        book = OrderBookSummary(
+            token_id="t1", best_bid=0.01, best_ask=0.03,
+            mid_price=0.02, spread=0.02, bid_depth=0, ask_depth=1000,
+        )
+        prob = paper_bot._ob_imbalance_probability(book)
+        # Would be 0.02 - 0.05 = -0.03, clamped to 0.01
+        assert prob == 0.01
+
+    @pytest.mark.asyncio
+    async def test_crypto_ssvi_failure_falls_back_to_ob_imbalance(self, paper_bot):
+        """When SSVI fails for crypto multi-token market, fall back to OB imbalance."""
+        market = Market(
+            condition_id="c1", question="BTC above $100k?", description="",
+            category=MarketCategory.CRYPTO,
+            tokens=[
+                {"token_id": "t1", "outcome": "Yes"},
+                {"token_id": "t2", "outcome": "No"},
+                {"token_id": "t3", "outcome": "Maybe"},
+            ],
+            end_date="", active=True, volume=5000, liquidity=2000, neg_risk=False,
+        )
+        # SSVI will fail → should fall back to OB imbalance
+        book = OrderBookSummary(
+            token_id="t1", best_bid=0.50, best_ask=0.60,
+            mid_price=0.55, spread=0.10, bid_depth=300, ask_depth=100,
+        )
+        with patch.object(paper_bot, "_ssvi_probability", side_effect=ValueError("low R²")):
+            prob = await paper_bot._estimate_probability(market, book)
+        await paper_bot.close()
+        # Should use OB imbalance, not mid_price
+        assert prob > 0.55
+
+
+class TestOrderBookImbalanceEndToEnd:
+    """End-to-end: imbalanced book → edge detected → order placed."""
+
+    @pytest.fixture
+    def paper_bot(self, tmp_path):
+        clob = ClobConfig(api_key="test", api_secret="test", api_passphrase="test")
+        chain = ChainConfig(
+            private_key="ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        bot_cfg = BotConfig(
+            paper_mode=True,
+            db_path=str(tmp_path / "e2e_ob.db"),
+            max_markets=3,
+            kelly_fraction=0.25,
+            min_edge=0.02,
+            ob_imbalance_weight=0.05,
+        )
+        setup_logging("DEBUG")
+        return PolymarketBot(clob, chain, bot_cfg)
+
+    @pytest.mark.asyncio
+    async def test_imbalanced_book_produces_orders(self, paper_bot):
+        """With a bid-heavy book, the bot should find edge and place orders."""
+        market = Market(
+            condition_id="c1", question="Will it rain tomorrow?", description="",
+            category=MarketCategory.OTHER,
+            tokens=[
+                {"token_id": "t1", "outcome": "Yes"},
+                {"token_id": "t2", "outcome": "No"},
+            ],
+            end_date="", active=True, volume=5000, liquidity=2000, neg_risk=False,
+        )
+        # Bid-heavy book: imbalance = (800-200)/1000 = 0.6 → +0.03 adjustment
+        imbalanced_book = OrderBookSummary(
+            token_id="t1", best_bid=0.48, best_ask=0.52,
+            mid_price=0.50, spread=0.04, bid_depth=800, ask_depth=200,
+        )
+        with patch.object(paper_bot.scanner, "scan_and_classify", return_value=[market]):
+            with patch.object(paper_bot.clob, "get_order_book", return_value=imbalanced_book):
+                summary = await paper_bot.scan_once()
+
+        await paper_bot.close()
+        assert summary["markets_with_edge"] >= 1
+        assert summary["orders_placed"] >= 1
 
 
 class TestPaperSlippage:

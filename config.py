@@ -62,6 +62,7 @@ class BotConfig:
     max_tradeable_price: float = 0.99
     max_spread: float = 0.10
     bankroll_multiplier: float = 10.0
+    ob_imbalance_weight: float = 0.05
 
     def __post_init__(self):
         if not (0 < self.kelly_fraction <= 1):
@@ -85,6 +86,10 @@ class BotConfig:
             raise ValueError(f"bankroll_multiplier must be > 0, got {self.bankroll_multiplier}")
         if self.log_format not in ("text", "json"):
             raise ValueError(f"log_format must be 'text' or 'json', got {self.log_format}")
+        if not (0 < self.ob_imbalance_weight <= 0.20):
+            raise ValueError(
+                f"ob_imbalance_weight must be in (0, 0.20], got {self.ob_imbalance_weight}"
+            )
 
 
 def validate_live_config(clob: ClobConfig, chain: ChainConfig, bot: BotConfig) -> None:
@@ -138,5 +143,6 @@ def load_config() -> Tuple[ClobConfig, ChainConfig, BotConfig]:
         max_tradeable_price=float(os.getenv("MAX_TRADEABLE_PRICE", "0.99")),
         max_spread=float(os.getenv("MAX_SPREAD", "0.10")),
         bankroll_multiplier=float(os.getenv("BANKROLL_MULTIPLIER", "10.0")),
+        ob_imbalance_weight=float(os.getenv("OB_IMBALANCE_WEIGHT", "0.05")),
     )
     return clob, chain, bot

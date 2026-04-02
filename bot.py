@@ -24,7 +24,6 @@ from ssvi import (
     SSVIParams,
     extract_probability,
     fit_ssvi,
-    generate_synthetic_surface,
 )
 
 logger = logging.getLogger("polymarket-bot")
@@ -83,14 +82,13 @@ def _estimate_live_fill_price(
         depth = book.ask_depth
         if depth <= 0:
             return None
-        # Linear impact: fraction of depth consumed × half spread
-        impact = (size / depth) * (book.spread / 2) if depth > 0 else 0
+        impact = (size / depth) * (book.spread / 2)
         estimated = nominal_price + impact
     else:
         depth = book.bid_depth
         if depth <= 0:
             return None
-        impact = (size / depth) * (book.spread / 2) if depth > 0 else 0
+        impact = (size / depth) * (book.spread / 2)
         estimated = nominal_price - impact
 
     # Check if estimated slippage exceeds our tolerance
@@ -220,17 +218,20 @@ class PolymarketBot:
         self, market: Market, bankroll: float, current_exposure: float
     ) -> Optional[KellyResult]:
         if not market.yes_token_id:
+            logger.debug(f"Skip {market.question[:40]}: no yes_token_id")
             return None
 
         book = await self.clob.get_order_book(market.yes_token_id)
         market_price = book.mid_price
 
         if market_price <= self.config.min_tradeable_price or market_price >= self.config.max_tradeable_price:
+            logger.debug(f"Skip {market.question[:40]}: price={market_price:.4f} out of bounds")
             return None
         if book.spread > self.config.max_spread:
+            logger.debug(f"Skip {market.question[:40]}: spread={book.spread:.4f} > {self.config.max_spread}")
             return None
 
-        estimated_prob = await self._estimate_probability(market, book.mid_price)
+        estimated_prob = await self._estimate_probability(market, book)
 
         result = kelly_criterion(
             estimated_prob=estimated_prob,
@@ -242,6 +243,10 @@ class PolymarketBot:
         )
 
         if result is None:
+            logger.debug(
+                f"Skip {market.question[:40]}: no edge "
+                f"(est={estimated_prob:.4f} mkt={market_price:.4f})"
+            )
             return None
 
         adjusted_size = check_position_limits(
@@ -260,33 +265,41 @@ class PolymarketBot:
         return result
 
     async def _estimate_probability(
-        self, market: Market, mid_price: float
+        self, market: Market, book: OrderBookSummary
     ) -> float:
+        mid_price = book.mid_price
+
         # For crypto markets with multiple strikes, try SSVI on real data
         if market.category == MarketCategory.CRYPTO and len(market.tokens) >= 3:
             try:
                 return await self._ssvi_probability(market, mid_price)
             except Exception as e:
-                logger.debug(f"SSVI failed, using fallback: {e}")
+                logger.debug(f"SSVI failed, falling back to OB imbalance: {e}")
 
-        # Fallback: synthetic surface (paper mode / demo)
-        try:
-            strikes, ivs = generate_synthetic_surface(
-                spot=mid_price, base_vol=0.5, time_to_expiry=1.0 / 365
-            )
-            params = fit_ssvi(strikes, ivs, forward=mid_price, time_to_expiry=1.0 / 365)
-            if params.r_squared < self.config.ssvi_r2_threshold:
-                logger.info(
-                    f"SSVI R²={params.r_squared:.4f} below threshold "
-                    f"{self.config.ssvi_r2_threshold}, using mid-price"
-                )
-                return mid_price
-            prob = extract_probability(
-                params, spot=mid_price, forward=mid_price, time_to_expiry=1.0 / 365
-            )
-            return prob.probability_above
-        except Exception:
-            return mid_price
+        # Primary fallback: order book imbalance model
+        return self._ob_imbalance_probability(book)
+
+    def _ob_imbalance_probability(self, book: OrderBookSummary) -> float:
+        """Estimate probability from order book depth imbalance.
+
+        When bid_depth >> ask_depth, informed traders expect the price to
+        rise, so the true probability is likely above mid-price.
+        """
+        total_depth = book.bid_depth + book.ask_depth
+        if total_depth <= 0:
+            logger.debug("OB imbalance: zero total depth, using mid-price")
+            return book.mid_price
+
+        imbalance = (book.bid_depth - book.ask_depth) / total_depth
+        adjusted = book.mid_price + imbalance * self.config.ob_imbalance_weight
+        clamped = max(0.01, min(0.99, adjusted))
+
+        logger.debug(
+            f"OB imbalance: bid_depth={book.bid_depth:.1f} "
+            f"ask_depth={book.ask_depth:.1f} imbalance={imbalance:.3f} "
+            f"mid={book.mid_price:.4f} adjusted={clamped:.4f}"
+        )
+        return clamped
 
     async def _ssvi_probability(self, market: Market, mid_price: float) -> float:
         prices = []
@@ -298,17 +311,16 @@ class PolymarketBot:
                 prices.append(0.5)
 
         if len(prices) < 3:
-            return mid_price
+            raise ValueError("Need >= 3 tokens for SSVI surface")
 
         strikes = np.linspace(0.2, 0.8, len(prices))
         ivs = np.array([max(0.1, abs(p - 0.5) * 2 + 0.3) for p in prices])
         params = fit_ssvi(strikes, ivs, forward=0.5, time_to_expiry=1.0 / 365)
         if params.r_squared < self.config.ssvi_r2_threshold:
-            logger.info(
-                f"Multi-token SSVI R²={params.r_squared:.4f} below threshold, "
-                f"falling back to mid-price"
+            raise ValueError(
+                f"Multi-token SSVI R²={params.r_squared:.4f} below threshold "
+                f"{self.config.ssvi_r2_threshold}"
             )
-            return mid_price
         prob = extract_probability(params, spot=mid_price, forward=0.5, time_to_expiry=1.0 / 365)
         return prob.probability_above
 
