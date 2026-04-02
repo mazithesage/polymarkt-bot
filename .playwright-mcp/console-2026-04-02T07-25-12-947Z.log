@@ -1,0 +1,2 @@
+[     286ms] [ERROR] Failed to load resource: the server responded with a status of 400 () @ https://clob.polymarket.com/prices-history:0
+[     492ms] [ERROR] Failed to load resource: the server responded with a status of 404 () @ https://clob.polymarket.com/favicon.ico:0

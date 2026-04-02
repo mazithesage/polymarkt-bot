@@ -61,6 +61,7 @@ class BotConfig:
     min_tradeable_price: float = 0.01
     max_tradeable_price: float = 0.99
     max_spread: float = 0.10
+    min_liquidity: float = 5000.0
     bankroll_multiplier: float = 10.0
     ob_imbalance_weight: float = 0.05
 
@@ -142,6 +143,7 @@ def load_config() -> Tuple[ClobConfig, ChainConfig, BotConfig]:
         min_tradeable_price=float(os.getenv("MIN_TRADEABLE_PRICE", "0.01")),
         max_tradeable_price=float(os.getenv("MAX_TRADEABLE_PRICE", "0.99")),
         max_spread=float(os.getenv("MAX_SPREAD", "0.10")),
+        min_liquidity=float(os.getenv("MIN_LIQUIDITY", "5000.0")),
         bankroll_multiplier=float(os.getenv("BANKROLL_MULTIPLIER", "10.0")),
         ob_imbalance_weight=float(os.getenv("OB_IMBALANCE_WEIGHT", "0.05")),
     )

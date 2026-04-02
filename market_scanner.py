@@ -3,9 +3,7 @@
 import asyncio
 import json
 import logging
-import math
 import re
-from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -58,27 +56,6 @@ CATEGORY_KEYWORDS: Dict[MarketCategory, List[str]] = {
 }
 
 
-def _build_idf_weights() -> Dict[str, float]:
-    """Precompute IDF weights from the keyword corpus.
-
-    IDF(term) = log(N / df) where N = number of categories and
-    df = number of categories containing that term.
-    Terms unique to one category get the highest weight.
-    """
-    n_categories = len(CATEGORY_KEYWORDS)
-    doc_freq: Dict[str, int] = defaultdict(int)
-    for keywords in CATEGORY_KEYWORDS.values():
-        seen = set()
-        for kw in keywords:
-            if kw not in seen:
-                doc_freq[kw] += 1
-                seen.add(kw)
-    return {term: math.log(n_categories / df) for term, df in doc_freq.items()}
-
-
-_IDF_WEIGHTS = _build_idf_weights()
-
-
 @dataclass
 class Market:
     condition_id: str
@@ -115,34 +92,30 @@ _TOKEN_RE = re.compile(r"[a-z0-9&]+(?:'[a-z]+)?")
 
 
 def classify_market(question: str, description: str = "") -> MarketCategory:
-    """Classify market text using TF-IDF weighted keyword scoring.
+    """Classify market text by keyword hit count.
 
-    Each keyword hit is weighted by its IDF — keywords unique to a single
-    category are strong discriminators, while keywords appearing across many
-    categories contribute less signal.  Single-word keywords use prefix
-    matching against properly tokenized text (handles plurals, possessives).
-    Multi-word phrases use substring matching.
+    Single-word keywords use prefix matching against tokenized text
+    (handles plurals/possessives).  Multi-word phrases use substring
+    matching.  Category with the most hits wins.
     """
     text = (question + " " + description).lower()
     text_tokens = _TOKEN_RE.findall(text)
 
-    scores: dict[MarketCategory, float] = {}
+    best_category = MarketCategory.OTHER
+    best_score = 0
     for category, keywords in CATEGORY_KEYWORDS.items():
-        score = 0.0
+        score = 0
         for kw in keywords:
             if " " in kw:
-                # Multi-word phrase: substring match
                 if kw in text:
-                    score += _IDF_WEIGHTS.get(kw, 1.0)
+                    score += 1
             else:
-                # Single word: prefix match handles plurals (democrat→democrats)
                 if any(tok.startswith(kw) for tok in text_tokens):
-                    score += _IDF_WEIGHTS.get(kw, 1.0)
-        if score > 0:
-            scores[category] = score
-    if not scores:
-        return MarketCategory.OTHER
-    return max(scores, key=scores.get)
+                    score += 1
+        if score > best_score:
+            best_score = score
+            best_category = category
+    return best_category
 
 
 def _parse_market(raw: dict) -> Market:
@@ -229,7 +202,7 @@ class MarketScanner:
                 "closed": "false",
                 "limit": str(fetch_size),
                 "offset": str(offset),
-                "order": "volume",
+                "order": "liquidity",
                 "ascending": "false",
             }
             try:

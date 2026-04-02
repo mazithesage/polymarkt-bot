@@ -164,8 +164,8 @@ class PolymarketBot:
 
         try:
             markets = await self.scanner.scan_and_classify(
-                limit=self.config.max_markets * 5,
-                min_liquidity=100.0,
+                limit=self.config.max_markets * 20,
+                min_liquidity=self.config.min_liquidity,
             )
             summary["markets_found"] = len(markets)
             logger.info(f"Found {len(markets)} active markets")
@@ -206,6 +206,19 @@ class PolymarketBot:
             orders_placed=summary["orders_placed"],
             paper_mode=self.config.paper_mode,
         )
+
+        if summary["markets_found"] > 0 and summary["markets_with_edge"] == 0:
+            logger.warning(
+                f"Evaluated {summary['markets_found']} markets but found 0 "
+                f"with edge — all filtered by spread/price bounds. "
+                f"Check market conditions or loosen max_spread "
+                f"(currently {self.config.max_spread})."
+            )
+        elif summary["markets_found"] == 0:
+            logger.warning(
+                "No active markets returned from Gamma API — "
+                "check min_liquidity filter or API availability."
+            )
 
         logger.info(
             f"Scan complete: {summary['markets_found']} markets, "

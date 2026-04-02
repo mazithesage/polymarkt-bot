@@ -65,29 +65,22 @@ def test_classify_case_insensitive():
     assert classify_market("BITCOIN price prediction") == MarketCategory.CRYPTO
 
 
-# --- TF-IDF scoring tests ---
+# --- keyword matching edge cases ---
 
-def test_tfidf_weights_are_positive():
-    """All IDF weights should be positive (log(N/df) > 0 when df < N)."""
-    from market_scanner import _IDF_WEIGHTS
-    assert len(_IDF_WEIGHTS) > 0
-    assert all(w > 0 for w in _IDF_WEIGHTS.values())
-
-def test_tfidf_handles_plurals():
+def test_handles_plurals():
     """Prefix matching should handle 'democrats' → 'democrat'."""
     assert classify_market("Democrats control Congress") == MarketCategory.POLITICS
 
-def test_tfidf_handles_punctuation():
+def test_handles_punctuation():
     """Tokenizer strips punctuation so 'bitcoin?' matches 'bitcoin'."""
     assert classify_market("Bitcoin?") == MarketCategory.CRYPTO
 
-def test_tfidf_multi_word_phrase():
+def test_multi_word_phrase():
     """Multi-word phrases like 'super bowl' should match as substrings."""
     assert classify_market("Who will win the Super Bowl this year?") == MarketCategory.SPORTS
 
-def test_tfidf_no_false_positive_on_substring():
+def test_no_false_positive_on_substring():
     """Single-word keywords should NOT match inside other words (e.g. 'eth' in 'whether')."""
-    # "whether" should not trigger "eth" match
     result = classify_market("Whether or not it happens")
     assert result == MarketCategory.OTHER
 
