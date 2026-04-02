@@ -37,8 +37,9 @@ data/*.db.lock
 .DS_Store
 Thumbs.db
 
-# pytest
+# pytest / hypothesis
 .pytest_cache/
+.hypothesis/
 
 # mypy
 .mypy_cache/
